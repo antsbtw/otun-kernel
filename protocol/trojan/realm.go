@@ -12,8 +12,8 @@ import (
 	E "github.com/sagernet/sing/common/exceptions"
 	M "github.com/sagernet/sing/common/metadata"
 
-	otunrealmlib "github.com/antsbtw/otun-s/transport/realm"
-	otuntrojan "github.com/antsbtw/otun-s/overlay/trojan"
+	otunrealmlib "github.com/sagernet/sing-box/transport/realm"
+	otuntrojan "github.com/sagernet/sing-box/overlay/trojan"
 )
 
 // realmDialer holds the parameters to stand up a FRESH Trojan-over-realm conn

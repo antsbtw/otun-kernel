@@ -12,8 +12,8 @@ import (
 	E "github.com/sagernet/sing/common/exceptions"
 	M "github.com/sagernet/sing/common/metadata"
 
-	otunreality "github.com/antsbtw/otun-s/overlay/reality"
-	otunrealmlib "github.com/antsbtw/otun-s/transport/realm"
+	otunreality "github.com/sagernet/sing-box/overlay/reality"
+	otunrealmlib "github.com/sagernet/sing-box/transport/realm"
 )
 
 // realmDialer dials a FRESH VLESS-Reality-over-realm conn per call.

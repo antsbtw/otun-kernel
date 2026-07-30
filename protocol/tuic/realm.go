@@ -9,7 +9,7 @@ import (
 	E "github.com/sagernet/sing/common/exceptions"
 	aTLS "github.com/sagernet/sing/common/tls"
 
-	otuntuic "github.com/antsbtw/otun-s/overlay/tuic"
+	otuntuic "github.com/sagernet/sing-box/overlay/tuic"
 
 	"github.com/gofrs/uuid/v5"
 )

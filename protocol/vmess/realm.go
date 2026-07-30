@@ -12,8 +12,8 @@ import (
 	E "github.com/sagernet/sing/common/exceptions"
 	M "github.com/sagernet/sing/common/metadata"
 
-	otunvmess "github.com/antsbtw/otun-s/overlay/vmess"
-	otunrealmlib "github.com/antsbtw/otun-s/transport/realm"
+	otunvmess "github.com/sagernet/sing-box/overlay/vmess"
+	otunrealmlib "github.com/sagernet/sing-box/transport/realm"
 )
 
 // realmDialer dials a FRESH VMess-over-realm conn per call. Like Trojan/SS, a
