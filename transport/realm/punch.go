@@ -148,6 +148,9 @@ func PunchTraced(ctx context.Context, cfg Config, realmID string, trace *Trace) 
 		return nil, E.Cause(err, "realm connect")
 	}
 	trace.RendezvousDone(response.Addresses)
+	// ★双端 join 键：用会合面下发的 metadata（下面 racePunch 实际打洞用的就是它），
+	// 不是上面本地生成的 metadata——接收端记的是前者，用错就永远配不上对。
+	trace.NonceNegotiated(response.PunchMetadata)
 	trace.CandidatesComputed(response.Addresses)
 
 	winner, result, err := racePunch(ctx, surviving, response.Addresses, response.PunchMetadata)

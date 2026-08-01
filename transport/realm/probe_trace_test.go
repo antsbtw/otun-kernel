@@ -27,6 +27,7 @@ func TestNilTraceIsNoOp(t *testing.T) {
 	var trace *Trace
 	trace.STUNDone(nil, nil)
 	trace.RendezvousDone(nil)
+	trace.NonceNegotiated(squic.PunchMetadata{})
 	trace.CandidatesComputed(nil)
 	trace.HelloSent()
 	trace.PunchDone(squic.PunchResult{}, "v4", "")
@@ -167,5 +168,35 @@ func TestClassifyErrorPrefersSpecificCause(t *testing.T) {
 	}
 	if got := classifyError(nil); got != "" {
 		t.Errorf("classifyError(nil) = %q, want empty", got)
+	}
+}
+
+// nonce 是双端 join 键：必须是会合面 metadata 的 32 位 hex，与接收端
+// （egress punch_trace_egress.payload.nonce）格式逐字符一致，否则配不上对。
+func TestTraceNonceIsHexJoinKey(t *testing.T) {
+	trace := NewTrace("egress-nj-02", "hysteria2")
+	var metadata squic.PunchMetadata
+	for i := range metadata.Nonce {
+		metadata.Nonce[i] = byte(i)
+	}
+	trace.NonceNegotiated(metadata)
+
+	out := decodeTrace(t, trace)
+	got, _ := out["nonce"].(string)
+	const want = "000102030405060708090a0b0c0d0e0f"
+	if got != want {
+		t.Fatalf("nonce = %q, want %q（接收端同款 hex.EncodeToString，两端必须一致）", got, want)
+	}
+}
+
+// 未调用 NonceNegotiated（如失败在会合面之前）时 nonce 必须缺席而非空串——
+// omitempty 让"没协商到 nonce"与"nonce 是空的"在数据里可区分。
+func TestTraceNonceAbsentWhenNotNegotiated(t *testing.T) {
+	trace := NewTrace("egress-nj-02", "hysteria2")
+	trace.Fail(FailStageRendezvous, errors.New("connect 404"))
+
+	out := decodeTrace(t, trace)
+	if _, present := out["nonce"]; present {
+		t.Fatal("未协商 nonce 时 JSON 里不应出现 nonce 键")
 	}
 }

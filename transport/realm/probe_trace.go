@@ -28,6 +28,7 @@ package realm
 //   - 记录的是「事实」（哪一步、耗时多少、匹配到哪个候选），不做结论推断。
 
 import (
+	"encoding/hex"
 	"encoding/json"
 	"net/netip"
 	"sync"
@@ -94,6 +95,17 @@ type Trace struct {
 	RealmID  string `json:"realm_id,omitempty"`
 	Protocol string `json:"protocol,omitempty"`
 
+	// Nonce 是本次打洞的 16 字节 nonce（hex）——★双端 join 键。
+	//
+	// 接收端（egress）从收到的打洞包里解出同一个 nonce 并写进 punch_trace_egress，
+	// 两端靠它配对，才能算出 H1 的差集（发起端判成功 vs 接收端确实收到并回了 Ack）。
+	// 没有它，双端数据只能按时间窗猜，配不成对。
+	//
+	// 🔴 取值必须是**会合面下发的** metadata（ConnectResponse.PunchMetadata），
+	// 不是客户端本地 GeneratePunchMetadata 生成的那个——实际打洞包用的是前者，
+	// 接收端记的也是前者，用错就永远配不上对。
+	Nonce string `json:"nonce,omitempty"`
+
 	TunnelEstablished bool      `json:"tunnel_established"`
 	FailStage         FailStage `json:"fail_stage,omitempty"`
 	ErrorCode         string    `json:"error_code,omitempty"`
@@ -153,6 +165,20 @@ func (t *Trace) RendezvousDone(peerCandidates []netip.AddrPort) {
 	defer t.access.Unlock()
 	t.stageDone(&t.Stages.RendezvousMs)
 	t.Punch.PeerCandidates = addrPortsToStrings(peerCandidates)
+}
+
+// NonceNegotiated 记录本次打洞的 nonce（双端 join 键）。
+//
+// 单独一个方法而非并进 RendezvousDone，是因为 nonce 的来源与 peerCandidates 不同：
+// 它必须取会合面下发的 metadata，而 RendezvousDone 的既有调用点/测试都只传候选地址。
+// 分开加，既不改既有签名，也让"用错 metadata 就配不上对"这件事在调用点显式可见。
+func (t *Trace) NonceNegotiated(metadata squic.PunchMetadata) {
+	if t == nil {
+		return
+	}
+	t.access.Lock()
+	defer t.access.Unlock()
+	t.Nonce = hex.EncodeToString(metadata.Nonce[:])
 }
 
 // CandidatesComputed 记录候选地址计算结果（阶段 [3]）。
@@ -237,9 +263,12 @@ func (t *Trace) MarshalJSON() ([]byte, error) {
 	}
 	t.access.Lock()
 	defer t.access.Unlock()
+	// ⚠️ 这是**白名单**：Trace 上加了字段，这里不加就不会出现在输出里
+	// （加 Nonce 时踩过，测试抓到）。新增字段务必两处同改。
 	type alias struct {
 		RealmID           string      `json:"realm_id,omitempty"`
 		Protocol          string      `json:"protocol,omitempty"`
+		Nonce             string      `json:"nonce,omitempty"`
 		TunnelEstablished bool        `json:"tunnel_established"`
 		FailStage         FailStage   `json:"fail_stage,omitempty"`
 		ErrorCode         string      `json:"error_code,omitempty"`
@@ -250,6 +279,7 @@ func (t *Trace) MarshalJSON() ([]byte, error) {
 	return json.Marshal(alias{
 		RealmID:           t.RealmID,
 		Protocol:          t.Protocol,
+		Nonce:             t.Nonce,
 		TunnelEstablished: t.TunnelEstablished,
 		FailStage:         t.FailStage,
 		ErrorCode:         t.ErrorCode,
