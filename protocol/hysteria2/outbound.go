@@ -113,6 +113,10 @@ func NewOutbound(ctx context.Context, router adapter.Router, logger log.ContextL
 			},
 			Logger: logger,
 		}
+		// 探针构建（-tags otun_probe_trace）下挂上发起端打洞观测；生产构建里
+		// attachProbeDialObserver 是空实现，realmOptions 一字不改。见
+		// probe_dial_observer.go 顶部的三层隔离说明。
+		attachProbeDialObserver(realmOptions, options.Realm.RealmID)
 	}
 	networkList := options.Network.Build()
 	client, err := hysteria2.NewClient(hysteria2.ClientOptions{
