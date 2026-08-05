@@ -1,0 +1,76 @@
+name: Build libbox.aar
+
+# 为什么存在：中国侧测试机（realm-cn-01 上的安卓探针机）与开发机之间只有一条
+# ~20KB/s 的 CF Tunnel，传 97MB 的 aar 要 80 分钟；而该机直连 GitHub 有 ~1.2MB/s。
+# 且它没有 NDK、dl.google.com 不可达。⇒ 把编译放到 CI，两边都不传大文件。
+#
+# 手动触发（workflow_dispatch）为主：客户端内核改动后按需出包，不占用每次 push。
+
+on:
+  workflow_dispatch:
+    inputs:
+      debug:
+        description: "构建 debug 版（内核日志落 logcat，供排查用）"
+        type: boolean
+        default: true
+  push:
+    tags:
+      - "libbox-*"
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: "1.25"
+          cache: true
+
+      # build_libbox 的 checkJavaVersion() 硬性要求 "openjdk 17"
+      - name: Setup JDK 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      - name: Setup Android NDK
+        id: ndk
+        uses: nttld/setup-ndk@v1
+        with:
+          ndk-version: r27c
+
+      - name: Build aar
+        env:
+          ANDROID_NDK_HOME: ${{ steps.ndk.outputs.ndk-path }}
+          NDK_HOME: ${{ steps.ndk.outputs.ndk-path }}
+        run: |
+          set -euo pipefail
+          go run ./cmd/internal/build_libbox -target android ${{ inputs.debug && '-debug' || '' }}
+          ls -l libbox.aar
+
+      # 产物校验：确认中继代码真的进了 so，避免"编出来了但没带上"
+      - name: Verify relay symbols
+        run: |
+          set -euo pipefail
+          unzip -p libbox.aar jni/arm64-v8a/libbox.so > /tmp/libbox.so
+          ctl=$(grep -ac "punch timeout" /tmp/libbox.so || true)   # 对照组，必须 >0
+          relay=$(grep -ac "realm relay" /tmp/libbox.so || true)
+          otrl=$(grep -ac "OTRL" /tmp/libbox.so || true)
+          echo "control(punch timeout)=$ctl  realm relay=$relay  OTRL=$otrl"
+          # 对照组为 0 说明 grep 本身失效，此时 relay=0 不可信 —— 一并判失败
+          if [ "$ctl" -eq 0 ]; then echo "::error::对照组失效，校验不可信"; exit 1; fi
+          if [ "$relay" -eq 0 ] || [ "$otrl" -eq 0 ]; then
+            echo "::error::aar 未包含中继代码"; exit 1
+          fi
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: libbox-aar-${{ github.sha }}
+          path: libbox.aar
+          retention-days: 14
+          compression-level: 0   # aar 本身已压缩，再压纯浪费时间
