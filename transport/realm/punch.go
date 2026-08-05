@@ -166,6 +166,29 @@ func PunchTraced(ctx context.Context, cfg Config, realmID string, trace *Trace) 
 			stage = FailStageCandidate
 		}
 		trace.Fail(stage, err)
+
+		// ★中继回退（RELAY_FALLBACK_DESIGN.md §3.1）：对称 NAT 下打洞必败，
+		// 改由客户端与节点各自主动出站连中继、按 nonce 对接。返回的 PacketConn
+		// 与打洞出来的等价，上层握手照常端到端跑（中继看不到明文）。
+		//
+		// 🔴 三条硬约束（违反即破坏既有行为）：
+		//  1. 只在会合面下发了 relay 地址时触发 —— 空则**一行都不执行**，
+		//     与改动前逐字节一致（老会合面不返 relay 字段 → 恒为空）。
+		//  2. 上面的 trace.Fail 保持在回退**之前**：Fail 是首次记录生效，
+		//     所以 trace 里留下的永远是真实的打洞卡点，不会被中继结果覆盖。
+		//  3. 回退失败时 return 的是**原 err**（打洞错误原文一字不改）——
+		//     既有 trace 归类、classifyError 与单测都依赖它。中继自身的错误
+		//     只进日志语义的 relay trace 字段，不进返回值。
+		if len(response.Relay) > 0 {
+			// racePunch 已关闭全部 socket；DialRelay 自己开新 socket、自己在
+			// 失败时关掉 —— 两条路径的 socket 所有权互不重叠，不存在重复关闭。
+			relayConn, relayErr := DialRelay(ctx, cfg, response.Relay, response.PunchMetadata.Nonce)
+			if relayErr == nil {
+				trace.RelayEstablished(relayConn.PeerAddr.String())
+				return relayConn, nil
+			}
+			trace.RelayFailed(relayErr)
+		}
 		return nil, err // racePunch closed all sockets on error
 	}
 	// mode 传空：punch/direct 是**节点侧配置**，客户端无从得知，由 prober 填

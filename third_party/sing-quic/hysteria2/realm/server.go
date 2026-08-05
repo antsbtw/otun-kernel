@@ -42,6 +42,13 @@ type Options struct {
 	// hysteria2 直连的 NAT 行为一致）——从而绕开"对称 NAT + 打洞对撞失败"。
 	// 空 → 完全走原 STUN + 打洞逻辑（默认，其它节点不受影响）。
 	DirectAddresses []netip.AddrPort
+
+	// RelayAddresses 非空 → 启用中继回退（RELAY_FALLBACK_DESIGN.md §3.2）：
+	// 收到会合面打洞事件时，本节点在打洞的同时向这些中继报到（报事件里的 nonce）。
+	// 客户端打洞失败转中继时，两条流按 nonce 对接，握手端到端跑通，出口仍是本节点。
+	//
+	// 与 DirectAddresses 同型：空 = 不启用，行为与改动前逐字节一致。
+	RelayAddresses []netip.AddrPort
 }
 
 type Server struct {
@@ -242,6 +249,16 @@ func (s *Server) readEvents(ctx context.Context, stream *EventStream, streamDone
 					s.options.Logger.Warn(E.Cause(postErr, "connect response post"))
 				}
 			}
+			// ★中继回退（§3.2）：与打洞**并行**去中继报到同一个 nonce。
+			// 必须并行而不是"打洞失败后再连"——本节点不知道客户端失败了
+			// （客户端失败是它本地 10s 超时，不会回头通知任何人），等失败再报到，
+			// 客户端早已超时。打洞成功则客户端不来，中继等待项自然超时回收。
+			//
+			// 🔴 传 s.punchConn：协议服务端监听的就是这只 socket，中继转发来的
+			// 客户端流量必须落到它上面才能进协议栈（见 relay.go 文件头）。
+			if len(s.options.RelayAddresses) > 0 {
+				go joinRelays(ctx, s.punchConn, s.options.RelayAddresses, metadata.Nonce)
+			}
 			// direct 模式（DirectAddresses 非空）：仅被动应答，不主动试探客户端反射地址。
 			// 节点是固定公网 IP，客户端主动连过来即可；主动对撞在对称 NAT 客户端下必败且无益。
 			passiveOnly := len(s.options.DirectAddresses) > 0
@@ -347,7 +364,7 @@ func (s *Server) handleHeartbeat(ctx context.Context) {
 		publish = slices.Clone(s.addresses)
 	}
 	s.addressAccess.RUnlock()
-	ttl, err := s.controlClient.Heartbeat(ctx, s.options.RealmID, sessionID, publish)
+	ttl, err := s.controlClient.Heartbeat(ctx, s.options.RealmID, sessionID, publish, s.options.RelayAddresses)
 	if err != nil {
 		statusErr, isStatus := E.Cast[*StatusError](err)
 		switch {
@@ -403,7 +420,7 @@ func (s *Server) reRegister(ctx context.Context) {
 	s.addressAccess.RLock()
 	addresses := slices.Clone(s.addresses)
 	s.addressAccess.RUnlock()
-	registration, err := s.controlClient.Register(ctx, s.options.RealmID, addresses)
+	registration, err := s.controlClient.Register(ctx, s.options.RealmID, addresses, s.options.RelayAddresses)
 	if err != nil {
 		s.options.Logger.Warn(E.Cause(err, "re-register"))
 		return

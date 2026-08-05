@@ -111,6 +111,16 @@ type Trace struct {
 	ErrorCode         string    `json:"error_code,omitempty"`
 	ErrorMsg          string    `json:"error_msg,omitempty"`
 
+	// Relay* 记录打洞失败后的中继回退（RELAY_FALLBACK_DESIGN.md §3.1）。
+	//
+	// 🔴 刻意与 FailStage/ErrorMsg **正交**：中继成功时 fail_stage 仍是 punch
+	// （打洞确实失败了，这是真实的卡点，分析打洞成功率时必须仍算失败），
+	// 只是 relay_used=true 表示这条连接最终由中继救回来了。把两者混在一起会让
+	// "打洞成功率"和"连接成功率"两个口径互相污染。
+	RelayUsed     bool   `json:"relay_used,omitempty"`
+	RelayAddr     string `json:"relay_addr,omitempty"`
+	RelayErrorMsg string `json:"relay_error_msg,omitempty"`
+
 	Stages Stages      `json:"stages"`
 	Punch  PunchDetail `json:"punch_detail"`
 
@@ -238,6 +248,37 @@ func (t *Trace) HandshakeDone() {
 	t.Stages.TotalMs = msSince(t.start)
 }
 
+// RelayEstablished 记录打洞失败后经中继救回了这条连接（§3.1）。
+//
+// 🔴 不动 FailStage：打洞确实失败过，那是真实卡点。relay_used 是**附加**事实，
+// 让分析既能看到"打洞成功率"（fail_stage=punch 仍计失败）又能看到"连接成功率"
+// （relay_used=true 即最终连上）。两个口径不能互相覆盖。
+// relayAddr 取字符串而非 M.Socksaddr：本文件刻意不 import sing 的 metadata
+// （见文件头 D3-B 的 import 环约束），埋点存的本就是字符串。
+func (t *Trace) RelayEstablished(relayAddr string) {
+	if t == nil {
+		return
+	}
+	t.access.Lock()
+	defer t.access.Unlock()
+	t.RelayUsed = true
+	t.RelayAddr = relayAddr
+	t.Stages.TotalMs = msSince(t.start)
+}
+
+// RelayFailed 记录中继回退也没救回来（打洞失败 + 中继失败）。
+// 同样不动 FailStage/ErrorMsg —— 返回给调用方的仍是打洞原始错误（硬约束）。
+func (t *Trace) RelayFailed(err error) {
+	if t == nil {
+		return
+	}
+	t.access.Lock()
+	defer t.access.Unlock()
+	if err != nil {
+		t.RelayErrorMsg = err.Error()
+	}
+}
+
 // Fail 记录失败阶段与原因。首次记录生效，避免上层包装错误覆盖真实卡点。
 func (t *Trace) Fail(stage FailStage, err error) {
 	if t == nil {
@@ -273,6 +314,9 @@ func (t *Trace) MarshalJSON() ([]byte, error) {
 		FailStage         FailStage   `json:"fail_stage,omitempty"`
 		ErrorCode         string      `json:"error_code,omitempty"`
 		ErrorMsg          string      `json:"error_msg,omitempty"`
+		RelayUsed         bool        `json:"relay_used,omitempty"`
+		RelayAddr         string      `json:"relay_addr,omitempty"`
+		RelayErrorMsg     string      `json:"relay_error_msg,omitempty"`
 		Stages            Stages      `json:"stages"`
 		Punch             PunchDetail `json:"punch_detail"`
 	}
@@ -284,6 +328,9 @@ func (t *Trace) MarshalJSON() ([]byte, error) {
 		FailStage:         t.FailStage,
 		ErrorCode:         t.ErrorCode,
 		ErrorMsg:          t.ErrorMsg,
+		RelayUsed:         t.RelayUsed,
+		RelayAddr:         t.RelayAddr,
+		RelayErrorMsg:     t.RelayErrorMsg,
 		Stages:            t.Stages,
 		Punch:             t.Punch,
 	})
