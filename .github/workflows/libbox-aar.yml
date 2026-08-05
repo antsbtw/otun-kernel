@@ -37,11 +37,15 @@ jobs:
           distribution: temurin
           java-version: "17"
 
+      # 🔴 版本必须 ≥ r28：r27c 的 ld.lld 不认 libcronet.a（预编译静态库）里的
+      # 重定位类型 315，链接期报 "unknown relocation (315) against symbol
+      # typeinfo for ..."。build_shared/sdk.go 钉的 fixedVersion 是
+      # 28.0.13004108，本机实测用 r29 亦可 —— 这里跟仓里钉的版本走。
       - name: Setup Android NDK
         id: ndk
         uses: nttld/setup-ndk@v1
         with:
-          ndk-version: r27c
+          ndk-version: r28
 
       # build_shared.FindMobile() 检查 $GOPATH/bin/gobind 是否存在，缺了直接
       # log.Fatal("missing gomobile installation")。装的是 sagernet 的 fork
