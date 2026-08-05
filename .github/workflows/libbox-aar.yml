@@ -43,6 +43,18 @@ jobs:
         with:
           ndk-version: r27c
 
+      # build_shared.FindMobile() 检查 $GOPATH/bin/gobind 是否存在，缺了直接
+      # log.Fatal("missing gomobile installation")。装的是 sagernet 的 fork
+      # （非上游 golang.org/x/mobile），版本随 go.mod 走，避免 CI 与本机不一致。
+      - name: Install gomobile
+        run: |
+          set -euo pipefail
+          ver=$(go list -m -f '{{.Version}}' github.com/sagernet/gomobile)
+          echo "gomobile version from go.mod: $ver"
+          go install github.com/sagernet/gomobile/cmd/gomobile@"$ver"
+          go install github.com/sagernet/gomobile/cmd/gobind@"$ver"
+          ls -l "$(go env GOPATH)/bin/gobind" "$(go env GOPATH)/bin/gomobile"
+
       - name: Build aar
         env:
           ANDROID_NDK_HOME: ${{ steps.ndk.outputs.ndk-path }}
