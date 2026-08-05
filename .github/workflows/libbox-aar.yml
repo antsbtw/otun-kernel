@@ -17,6 +17,10 @@ on:
     tags:
       - "libbox-*"
 
+# 发布 Release 资产需要写权限（默认 token 只读）。
+permissions:
+  contents: write
+
 jobs:
   build:
     runs-on: ubuntu-latest
@@ -90,3 +94,25 @@ jobs:
           path: libbox.aar
           retention-days: 14
           compression-level: 0   # aar 本身已压缩，再压纯浪费时间
+
+      # 同时发到 Release：本仓是公开仓，Release 资产**无需任何 token 即可
+      # curl 下载**，而 Actions artifact 即使公开仓也要认证。中国侧测试机
+      # （realm-cn-01）直连 GitHub 有 ~1.2MB/s，走这条通道取包约 80 秒；
+      # 而它到开发机的 CF Tunnel 只有 ~20KB/s（97MB 要 80 分钟）。
+      #
+      # 固定 tag `libbox-latest` + 覆盖式发布：测试机永远 curl 同一个 URL，
+      #   https://github.com/antsbtw/otun-kernel/releases/download/libbox-latest/libbox.aar
+      # prerelease 标记避免它被当成正式版本。
+      - name: Publish to Release (token-free download for CN test device)
+        uses: softprops/action-gh-release@v1
+        with:
+          tag_name: libbox-latest
+          name: libbox.aar (latest build)
+          prerelease: true
+          files: libbox.aar
+          body: |
+            commit: ${{ github.sha }}
+            branch: ${{ github.ref_name }}
+            debug: ${{ inputs.debug }}
+            含中继回退（RELAY_FALLBACK_DESIGN.md）。校验已在 CI 内跑过：
+            对照组 punch timeout 命中 + realm relay/OTRL 均非零。
