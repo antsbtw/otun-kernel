@@ -27,6 +27,16 @@ func ProbeRun(specJSON string, binder ProbeBinder) string {
 	return probeentry.RunProbeJSON(specJSON, probeBinderAdapter{binder})
 }
 
+// ProbeFetchTargets 用探测账号登录公网 portal BFF,拿全部在线节点×协议的连接串,
+// 返回一批可直接喂给 ProbeRun 的 Spec(JSON)。这是探针取数的正路:走公网、真机
+// 蜂窝可达,与用户/Linux prober 同源。fetchSpecJSON 见 probeentry.FetchSpec
+// (portal_base/email/password/device_id/auto_admit + 探测控制)。
+//
+// 🔴 password 只在一次登录请求里用,不落盘不进日志(probeportal 约束)。
+func ProbeFetchTargets(fetchSpecJSON string) string {
+	return probeentry.FetchTargetsJSON(fetchSpecJSON)
+}
+
 // probeBinderAdapter 把 gomobile 接口 ProbeBinder 适配成 probeentry.Binder
 // (= netbind.Binder)。null binder(壳侧不传)→ 适配器内层为 nil,RunProbe 侧
 // 按「不绑定」处理。

@@ -11,6 +11,7 @@ package main
 import (
 	"context"
 	"encoding/json"
+	"flag"
 	"fmt"
 	"io"
 	"os"
@@ -20,13 +21,34 @@ import (
 )
 
 func main() {
-	specJSON, err := io.ReadAll(os.Stdin)
+	fetch := flag.Bool("fetch", false, "读 FetchSpec(登录 portal 取全部节点连接串)并打印生成的 Spec 列表")
+	flag.Parse()
+
+	stdin, err := io.ReadAll(os.Stdin)
 	if err != nil {
 		fmt.Fprintln(os.Stderr, "read stdin:", err)
 		os.Exit(2)
 	}
+
+	if *fetch {
+		var fs probeentry.FetchSpec
+		if err := json.Unmarshal(stdin, &fs); err != nil {
+			fmt.Fprintln(os.Stderr, "parse fetch spec:", err)
+			os.Exit(2)
+		}
+		ctx, cancel := context.WithTimeout(context.Background(), 130*time.Second)
+		defer cancel()
+		res := probeentry.FetchTargets(ctx, &fs)
+		out, _ := json.MarshalIndent(res, "", "  ")
+		fmt.Println(string(out))
+		if res.Err != "" {
+			os.Exit(1)
+		}
+		return
+	}
+
 	var spec probeentry.Spec
-	if err := json.Unmarshal(specJSON, &spec); err != nil {
+	if err := json.Unmarshal(stdin, &spec); err != nil {
 		fmt.Fprintln(os.Stderr, "parse spec:", err)
 		os.Exit(2)
 	}
