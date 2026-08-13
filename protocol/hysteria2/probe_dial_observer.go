@@ -28,6 +28,7 @@ import (
 
 	realmtrace "github.com/sagernet/sing-box/transport/realm"
 	squic "github.com/sagernet/sing-quic/hysteria2/realm"
+	"github.com/sagernet/sing/common/logger"
 )
 
 // probeDialObserver 实现 squic.DialObserver，把回调翻成 Trace 调用。
@@ -35,7 +36,8 @@ import (
 // 🔴 trace 可以为 nil（埋点未开）——所有方法都靠 Trace 的 nil-receiver no-op 语义
 // 保持安全，本类型自身不做判空分支，与 transport/realm 的既有惯例一致。
 type probeDialObserver struct {
-	trace *realmtrace.Trace
+	trace  *realmtrace.Trace
+	logger logger.Logger
 }
 
 // STUNDiscovered 对应阶段 [1]：反射地址发现完毕。
@@ -70,12 +72,25 @@ func (o probeDialObserver) PunchAttempted(family string, candidates []netip.Addr
 //
 // mode 传空与 transport/realm.PunchTraced 一致 —— punch/direct 是**节点侧配置**，
 // 客户端无从得知，由 prober 填。内核不编造自己观测不到的事实。
+// PunchSettled 对应阶段 [5]：打洞落定，**同时是 hy2 路径上的输出时机**。
+//
+// ★ 为什么在这里 Emit，而不像五协议那样在握手完成后：
+// 五协议的 QUIC/TLS 握手在 kernel 自己的 overlay 里，能调 HandshakeDoneAndEmit；
+// hy2 的握手在 sing-quic 的 authenticateAndWrap 内部，kernel **观测不到**。
+// 打洞落定是 kernel 在 hy2 路径上能确知的最后一个事实，所以在此输出。
+//
+// 🔴 代价要说清楚：hy2 的 trace 因此**没有 handshake_ms、tunnel_established 恒 false**。
+// 这不是 bug 而是观测边界——内核不编造自己观测不到的事实（与 mode 传空同一条原则）。
+// 隧道到底通没通，由 prober 经隧道真实往返（HTTP 204）判定，那才是 ok 的来源。
+//
+// mode 传空同 transport/realm.PunchTraced —— punch/direct 是节点侧配置，客户端无从得知。
 func (o probeDialObserver) PunchSettled(family string, result squic.PunchResult, err error) {
 	if err != nil {
-		o.trace.Fail(realmtrace.FailStagePunch, err)
+		realmtrace.FailAndEmit(o.logger, o.trace, realmtrace.FailStagePunch, err)
 		return
 	}
 	o.trace.PunchDone(result, family, "")
+	realmtrace.Emit(o.logger, o.trace)
 }
 
 var _ squic.DialObserver = probeDialObserver{}

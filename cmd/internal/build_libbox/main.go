@@ -69,6 +69,16 @@ func init() {
 	sharedTags = append(sharedTags, "with_tailscale", "ts_omit_logtail", "ts_omit_ssh", "ts_omit_drive", "ts_omit_taildrop", "ts_omit_webclient", "ts_omit_doctor", "ts_omit_capture", "ts_omit_kube", "ts_omit_aws", "ts_omit_synology", "ts_omit_bird")
 	notMemcTags = append(notMemcTags, "with_low_memory")
 	debugTags = append(debugTags, "debug")
+
+	// 排障用：允许从环境追加 build tag（如 otun_probe_trace 打开 hy2 打洞埋点）。
+	// 不设则行为与之前完全一致 —— 默认构建零变化。
+	if extra := os.Getenv("OTUN_EXTRA_TAGS"); extra != "" {
+		for _, t := range strings.Split(extra, ",") {
+			if t = strings.TrimSpace(t); t != "" {
+				sharedTags = append(sharedTags, t)
+			}
+		}
+	}
 }
 
 type AndroidBuildConfig struct {

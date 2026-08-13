@@ -24,5 +24,5 @@ func attachProbeDialObserver(realmOptions *squic.Options, realmID string) {
 	if trace == nil {
 		return
 	}
-	realmOptions.DialObserver = probeDialObserver{trace: trace}
+	realmOptions.DialObserver = probeDialObserver{trace: trace, logger: realmOptions.Logger}
 }
