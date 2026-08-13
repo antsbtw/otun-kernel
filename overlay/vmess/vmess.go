@@ -50,6 +50,12 @@ type Options struct {
 	Security string
 	// AlterId selects legacy alterId users; 0 (AEAD-only) for modern VMess.
 	AlterId int
+
+	// Mode 选打洞路径（探针专用）。零值 = realm.ModeNormal，生产不设即原行为。
+	Mode realm.PunchMode
+
+	// Trace 探针注入的埋点。非 nil 时用它；nil 时保持 env 驱动的 realm.Session。
+	Trace *realm.Trace
 }
 
 // Client is a VMess overlay bound to one punched+wrapped hole. Build with Dial.
@@ -74,8 +80,8 @@ func Dial(ctx context.Context, opts Options) (*Client, error) {
 		security = "auto"
 	}
 	// 埋点：未开启时 trace 为 nil，以下所有 trace 调用都是 no-op（生产路径零影响）。
-	trace := realm.Session(opts.RealmID, "vmess")
-	punched, err := realm.PunchTraced(ctx, opts.Realm, opts.RealmID, trace)
+	trace := realm.SessionOr(opts.Trace, opts.RealmID, "vmess")
+	punched, err := realm.PunchTracedWithMode(ctx, opts.Realm, opts.RealmID, trace, opts.Mode)
 	if err != nil {
 		// 阶段归类已在 PunchTraced 内部完成，这里只负责输出。
 		realm.Emit(opts.Realm.Logger, trace)

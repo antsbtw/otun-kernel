@@ -46,6 +46,15 @@ type Options struct {
 	// UDPStream / ZeroRTTHandshake mirror TUIC's options.
 	UDPStream        bool
 	ZeroRTTHandshake bool
+
+	// Mode 选打洞路径（探针专用）。零值 = realm.ModeNormal，生产不设即原行为。
+	Mode realm.PunchMode
+
+	// Trace 探针注入的埋点。非 nil 时惰性打洞用它；nil 时保持 env 驱动的
+	// realm.Session（每次惰性打洞各出一条）。★TUIC 惰性打洞可能重试多次，
+	// 注入同一个 Trace 时后一次会覆盖前一次的字段 —— 探针每次探测只调一次
+	// DialConn，实践中打洞恰好发生一次，可接受；要精确到每次打洞用 env 模式。
+	Trace *realm.Trace
 }
 
 // Client is a TUIC overlay bound to one (lazily) punched hole. Build with Dial.
@@ -78,11 +87,16 @@ func Dial(ctx context.Context, opts Options) (*Client, error) {
 	// ★ 也因此 TUIC 的 trace 里没有 handshake_ms：QUIC/TLS 握手由 TUIC 引擎在
 	// 拿到 conn 之后自己做，overlay 这层看不见终点。宁可留空也不填一个
 	// 语义不同的值 —— 否则六行里 tuic 的 handshake_ms 与别人不是一把尺子。
+	// punchFn 的选择：埋点开启 **或** 指定了非默认路径（探针）时，走带 trace/mode
+	// 的版本；两者都不涉及时保持 realm.Punch 原样（生产惰性打洞逐字节不变）。
+	// mode 经闭包捕获（punchFn 签名固定，不能加参）。
 	punchFn := realm.Punch
-	if realm.ProbeTraceEnabled() {
+	if realm.ProbeTraceEnabled() || opts.Mode != realm.ModeNormal || opts.Trace != nil {
+		mode := opts.Mode
+		injected := opts.Trace
 		punchFn = func(ctx context.Context, cfg realm.Config, realmID string) (*realm.PunchedConn, error) {
-			trace := realm.Session(realmID, "tuic")
-			punched, err := realm.PunchTraced(ctx, cfg, realmID, trace)
+			trace := realm.SessionOr(injected, realmID, "tuic")
+			punched, err := realm.PunchTracedWithMode(ctx, cfg, realmID, trace, mode)
 			if err != nil {
 				realm.Emit(cfg.Logger, trace)
 				return nil, err

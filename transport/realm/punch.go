@@ -80,6 +80,32 @@ func Punch(ctx context.Context, cfg Config, realmID string) (*PunchedConn, error
 	return PunchTraced(ctx, cfg, realmID, nil)
 }
 
+// PunchMode 选择拨号走哪条路径。生产/默认恒为 ModeNormal（打洞优先、失败回退
+// 中继），只有探针入口为「隔离测某一条路径」才用另外两个。
+//
+// 🔴 这三条路径只影响 PunchTracedWithMode 内部的路径选择，不改任何返回类型或
+// 既有调用点签名 —— PunchTraced == PunchTracedWithMode(ModeNormal)。
+type PunchMode int
+
+const (
+	// ModeNormal：打洞优先，打洞失败且会合面下发了中继地址时回退中继。
+	// 这是生产唯一路径，与埋点前逐字节等价。
+	ModeNormal PunchMode = iota
+	// ModePunchOnly：只打洞，禁用中继回退（即便会合面下发了中继地址）。
+	// 探针用它隔离验证「这条路的打洞本身通不通」，不让中继成功掩盖打洞失败。
+	ModePunchOnly
+	// ModeRelayOnly：跳过打洞，直接连中继。探针用它隔离验证中继链路，
+	// 不受打洞结果干扰。会合面未下发中继地址时直接失败（candidate 阶段）。
+	ModeRelayOnly
+)
+
+// PunchTracedWithMode 是 PunchTraced 的路径可选版本：ModeNormal 时行为与
+// PunchTraced 逐字节等价（探针入口之外无人用别的 mode）。
+//
+// 🔴 零回归：PunchTraced 就是本函数 mode=ModeNormal 的薄包装，控制流在
+// ModeNormal 分支上与改动前一字未变，由 TestPunchTracedNilTraceMatchesPunch
+// 等既有单测继续把关。ModePunchOnly/ModeRelayOnly 是新增的、只有探针触达的分支。
+
 // PunchTraced 与 Punch 等价，额外把各阶段耗时与打洞细节记进 trace。
 //
 // ★ 刻意做成 Punch 的**兄弟函数**而不是改 Punch 的签名 —— 生产路径调用点
@@ -93,6 +119,11 @@ func Punch(ctx context.Context, cfg Config, realmID string) (*PunchedConn, error
 // 🔴 阶段归类刻意与 fail_stage 枚举一一对应，且**在错误发生的那一层**归类，
 // 不在上层猜：上层只看得到被 E.Cause 包过的错误原文，靠字符串反推必然漂。
 func PunchTraced(ctx context.Context, cfg Config, realmID string, trace *Trace) (*PunchedConn, error) {
+	return PunchTracedWithMode(ctx, cfg, realmID, trace, ModeNormal)
+}
+
+// PunchTracedWithMode 见 PunchMode 文档。ModeNormal 分支即原 PunchTraced 逻辑。
+func PunchTracedWithMode(ctx context.Context, cfg Config, realmID string, trace *Trace, mode PunchMode) (*PunchedConn, error) {
 	if realmID == "" {
 		return nil, E.New("realm: realm ID is required")
 	}
@@ -153,6 +184,28 @@ func PunchTraced(ctx context.Context, cfg Config, realmID string, trace *Trace) 
 	trace.NonceNegotiated(response.PunchMetadata)
 	trace.CandidatesComputed(response.Addresses)
 
+	// ★ModeRelayOnly（探针专用）：跳过打洞，直接连中继。会合面已下发 relay 地址
+	// 才有意义；未下发则归 candidate 阶段失败（与 ModeNormal 下「没地址可打」同类）。
+	// 🔴 只有探针 mode 走这里，ModeNormal 一步都不进 —— 生产路径不受影响。
+	if mode == ModeRelayOnly {
+		closeSurviving() // 打洞 socket 用不上，先关，避免泄漏
+		if len(response.Relay) == 0 {
+			err := E.New("realm relay-only: rendezvous returned no relay address")
+			trace.Fail(FailStageCandidate, err)
+			return nil, err
+		}
+		relayConn, relayErr := DialRelay(ctx, cfg, response.Relay, response.PunchMetadata.Nonce)
+		if relayErr != nil {
+			// 与 ModeNormal 回退失败同源：用 RelayFailed 记中继侧错误，
+			// 并把整体归 punch 阶段（relay 是打洞的替身，同类失败面）。
+			trace.Fail(FailStagePunch, relayErr)
+			trace.RelayFailed(relayErr)
+			return nil, E.Cause(relayErr, "realm relay-only")
+		}
+		trace.RelayEstablished(relayConn.PeerAddr.String())
+		return relayConn, nil
+	}
+
 	winner, result, err := racePunch(ctx, surviving, response.Addresses, response.PunchMetadata)
 	if err != nil {
 		// candidate 与 punch 的区分：会合面没给出任何可用地址 → candidate
@@ -179,6 +232,11 @@ func PunchTraced(ctx context.Context, cfg Config, realmID string, trace *Trace) 
 		//  3. 回退失败时 return 的是**原 err**（打洞错误原文一字不改）——
 		//     既有 trace 归类、classifyError 与单测都依赖它。中继自身的错误
 		//     只进日志语义的 relay trace 字段，不进返回值。
+		// ★ModePunchOnly（探针专用）：禁用中继回退，即便会合面下发了 relay 地址也不用，
+		// 让打洞失败如实暴露（不被中继成功掩盖）。ModeNormal 恒进回退分支，行为不变。
+		if mode == ModePunchOnly {
+			return nil, err // 打洞失败原文原样返回，与无中继老会合面路径一致
+		}
 		if len(response.Relay) > 0 {
 			// racePunch 已关闭全部 socket；DialRelay 自己开新 socket、自己在
 			// 失败时关掉 —— 两条路径的 socket 所有权互不重叠，不存在重复关闭。

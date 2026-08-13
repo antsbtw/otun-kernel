@@ -44,6 +44,16 @@ func Session(realmID string, protocol string) *Trace {
 	return NewTrace(realmID, protocol)
 }
 
+// SessionOr 是探针入口的 trace 选择器:injected 非 nil 时用它(探针把 trace 回填
+// 进结构化结果,不走 env/日志行);否则回到 env 驱动的 Session(生产未开埋点即
+// nil,零影响)。五个 overlay 的 Dial 用它统一「探针注入 vs 生产 env」两条来源。
+func SessionOr(injected *Trace, realmID string, protocol string) *Trace {
+	if injected != nil {
+		return injected
+	}
+	return Session(realmID, protocol)
+}
+
 // Emit 把埋点以单行 JSON 输出，前缀固定便于 prober 精确提取。
 // trace 为 nil（未开启埋点）时什么都不做。
 //
