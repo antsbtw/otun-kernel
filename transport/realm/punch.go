@@ -127,6 +127,14 @@ func PunchTracedWithMode(ctx context.Context, cfg Config, realmID string, trace 
 	if realmID == "" {
 		return nil, E.New("realm: realm ID is required")
 	}
+	// ★ModeRelayOnly 走精简路径：中继回退的立意就是「STUN/打洞不可用时的兜底」，
+	// 且服务端下发的中继地址来自节点注册（与客户端反射地址无关，已核 otun-s
+	// engine.Connect），所以 relay-only **不需要 STUN、不开打洞 socket**。只跑
+	// control.Connect 拿 relay 地址 + nonce，再直连中继。这也让「节点没配 STUN」
+	// （枚举 API 未下发 stun）不再阻塞纯中继链路的验证。
+	if mode == ModeRelayOnly {
+		return dialRelayOnly(ctx, cfg, realmID, trace)
+	}
 	if len(cfg.STUNServers) == 0 {
 		return nil, E.New("realm: at least one STUN server is required")
 	}
@@ -184,28 +192,6 @@ func PunchTracedWithMode(ctx context.Context, cfg Config, realmID string, trace 
 	trace.NonceNegotiated(response.PunchMetadata)
 	trace.CandidatesComputed(response.Addresses)
 
-	// ★ModeRelayOnly（探针专用）：跳过打洞，直接连中继。会合面已下发 relay 地址
-	// 才有意义；未下发则归 candidate 阶段失败（与 ModeNormal 下「没地址可打」同类）。
-	// 🔴 只有探针 mode 走这里，ModeNormal 一步都不进 —— 生产路径不受影响。
-	if mode == ModeRelayOnly {
-		closeSurviving() // 打洞 socket 用不上，先关，避免泄漏
-		if len(response.Relay) == 0 {
-			err := E.New("realm relay-only: rendezvous returned no relay address")
-			trace.Fail(FailStageCandidate, err)
-			return nil, err
-		}
-		relayConn, relayErr := DialRelay(ctx, cfg, response.Relay, response.PunchMetadata.Nonce)
-		if relayErr != nil {
-			// 与 ModeNormal 回退失败同源：用 RelayFailed 记中继侧错误，
-			// 并把整体归 punch 阶段（relay 是打洞的替身，同类失败面）。
-			trace.Fail(FailStagePunch, relayErr)
-			trace.RelayFailed(relayErr)
-			return nil, E.Cause(relayErr, "realm relay-only")
-		}
-		trace.RelayEstablished(relayConn.PeerAddr.String())
-		return relayConn, nil
-	}
-
 	winner, result, err := racePunch(ctx, surviving, response.Addresses, response.PunchMetadata)
 	if err != nil {
 		// candidate 与 punch 的区分：会合面没给出任何可用地址 → candidate
@@ -256,6 +242,74 @@ func PunchTracedWithMode(ctx context.Context, cfg Config, realmID string, trace 
 		PacketConn: winner.conn,
 		PeerAddr:   M.SocksaddrFromNetIP(result.PeerAddr),
 	}, nil
+}
+
+// dialRelayOnly 是 ModeRelayOnly 的精简路径：不做 STUN、不开打洞 socket，只跑
+// control.Connect 拿会合面下发的中继地址 + nonce，再直连中继。
+//
+// 🔴 为什么可以跳过 STUN 与打洞 socket：
+//   - 服务端下发的中继地址来自【节点注册】时上报的 relay 列表，与客户端反射地址
+//     无关（已核 otun-s core.Engine.Connect：relay=append(s.relay...)，clientAddrs
+//     只被转发给节点用于打洞，不影响 relay 下发）。所以传空 addresses 也能拿到
+//     relay + nonce。
+//   - 中继回退的立意本就是「对称 NAT 下 STUN/打洞不可用时的兜底」。若纯中继链路
+//     的验证还要先跑通 STUN，就把「中继是否工作」与「STUN 是否工作」耦在一起，
+//     违反探针「隔离某一条路径」的目标（也让没配 STUN 的节点无法验中继）。
+//
+// nonce 仍必须来自 control.Connect 的响应（response.PunchMetadata）——那是双端 join
+// 键，节点侧按它在中继上配对，本地生成的用错就永远配不上对（与打洞路径同一铁律）。
+func dialRelayOnly(ctx context.Context, cfg Config, realmID string, trace *Trace) (*PunchedConn, error) {
+	control, err := squic.NewControlClient(cfg.ServerURL, cfg.Token, cfg.HTTPClient)
+	if err != nil {
+		trace.Fail(FailStageRendezvous, err)
+		return nil, err
+	}
+	metadata, err := squic.GeneratePunchMetadata()
+	if err != nil {
+		trace.Fail(FailStageRendezvous, err)
+		return nil, E.Cause(err, "generate punch metadata")
+	}
+	// 会合面 /connect 硬性要求至少一个客户端地址（wire 层校验，与 relay 下发无关，
+	// 实测 400 bad_request）。relay-only 不打洞、不做 STUN，没有反射地址可填 ——
+	// 于是开一只【经 binder 绑定的】本地 UDP socket，用它的本地地址占位过校验。
+	//  - 走 cfg.Dialer（= netbind）保证真机上这只 socket 也绑到目标网络（蜂窝），
+	//    与中继 socket 的绑定行为一致；
+	//  - 节点侧会收到这个地址去尝试打洞，但 relay-only 场景下打洞不会成功也不影响
+	//    中继对接（中继按 nonce 配对，与地址无关）—— 占位地址无害。
+	// 用完即关：它只为拿一个本地地址，中继另开自己的 socket（DialRelay）。
+	placeholderConn, err := listenPacket(ctx, cfg, M.SocksaddrFrom(netip.IPv4Unspecified(), 0))
+	if err != nil {
+		trace.Fail(FailStageSTUN, err)
+		return nil, E.Cause(err, "relay-only: open local socket for address")
+	}
+	localAddr := placeholderConn.LocalAddr().(*net.UDPAddr)
+	localAddresses := []netip.AddrPort{localAddr.AddrPort()}
+	_ = placeholderConn.Close()
+
+	response, err := control.Connect(ctx, realmID, localAddresses, metadata)
+	if err != nil {
+		trace.Fail(FailStageRendezvous, err)
+		return nil, E.Cause(err, "realm connect")
+	}
+	trace.RendezvousDone(response.Addresses)
+	trace.NonceNegotiated(response.PunchMetadata)
+
+	if len(response.Relay) == 0 {
+		err := E.New("realm relay-only: rendezvous returned no relay address")
+		// 会合面没给中继地址 → 与「没地址可打」同类，归 candidate。
+		trace.Fail(FailStageCandidate, err)
+		return nil, err
+	}
+	relayConn, relayErr := DialRelay(ctx, cfg, response.Relay, response.PunchMetadata.Nonce)
+	if relayErr != nil {
+		// 与 ModeNormal 回退失败同源：RelayFailed 记中继侧错误，整体归 punch 阶段
+		// （relay 是打洞的替身，同类失败面）。
+		trace.Fail(FailStagePunch, relayErr)
+		trace.RelayFailed(relayErr)
+		return nil, E.Cause(relayErr, "realm relay-only")
+	}
+	trace.RelayEstablished(relayConn.PeerAddr.String())
+	return relayConn, nil
 }
 
 // familyConn is one address-family UDP socket plus its discovered candidates.

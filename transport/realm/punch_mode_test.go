@@ -50,19 +50,42 @@ func TestModeParameterValidation(t *testing.T) {
 	noSTUN.STUNServers = nil
 
 	ctx := context.Background()
+	// 空 realmID 对所有 mode 都应立即失败（第一道校验，先于任何路径分流）。
 	for _, mode := range []realm.PunchMode{realm.ModeNormal, realm.ModePunchOnly, realm.ModeRelayOnly} {
 		if _, err := realm.PunchTracedWithMode(ctx, base, "", nil, mode); err == nil {
 			t.Errorf("mode %d: empty realmID must fail", mode)
 		}
+	}
+	// 空 STUN 只挡打洞类路径（normal / punch_only）——它们必须做 STUN 发现。
+	for _, mode := range []realm.PunchMode{realm.ModeNormal, realm.ModePunchOnly} {
 		if _, err := realm.PunchTracedWithMode(ctx, noSTUN, "r", nil, mode); err == nil {
-			t.Errorf("mode %d: empty STUN must fail", mode)
+			t.Errorf("mode %d: empty STUN must fail (punch path needs STUN)", mode)
 		}
+	}
+	// ★relay_only 【不】要求 STUN：它跳过打洞，只连中继。空 STUN 不该在校验层被挡；
+	// 它照样会失败（loopback 会合面无此 realm → rendezvous 失败），但【不是】因为
+	// 缺 STUN —— 用有效 STUN 的 base 与空 STUN 的 noSTUN 应给出相同的失败原文。
+	trErr := failErr(realm.PunchTracedWithMode(ctx, base, "no-such-node", nil, realm.ModeRelayOnly))
+	noStunErr := failErr(realm.PunchTracedWithMode(ctx, noSTUN, "no-such-node", nil, realm.ModeRelayOnly))
+	if trErr == "" || noStunErr == "" {
+		t.Fatalf("relay-only against unregistered node must fail: base=%q noStun=%q", trErr, noStunErr)
+	}
+	if trErr != noStunErr {
+		t.Errorf("relay-only must not depend on STUN: with-STUN=%q vs no-STUN=%q", trErr, noStunErr)
 	}
 }
 
-// ModeRelayOnly / ModePunchOnly 在「节点未注册」下仍应在 rendezvous 阶段失败 ——
-// 证明 mode 不改变打洞前置流程（STUN → rendezvous），路径选择只发生在拿到
-// 会合面响应之后。
+func failErr(_ *realm.PunchedConn, err error) string {
+	if err == nil {
+		return ""
+	}
+	return err.Error()
+}
+
+// ModeRelayOnly / ModePunchOnly 在「节点未注册」下都应在 rendezvous 阶段失败：
+//   - punch_only 走完整前置（STUN → rendezvous），在 control.Connect 404 失败；
+//   - relay_only 走精简路径（dialRelayOnly，跳过 STUN），同样在 control.Connect
+//     404 失败。两者都在会合面这一步失败，归 rendezvous。
 func TestModesFailAtRendezvousWhenUnregistered(t *testing.T) {
 	if testing.Short() {
 		t.Skip("skipping network integration test in -short")
