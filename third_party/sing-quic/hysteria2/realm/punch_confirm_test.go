@@ -169,3 +169,47 @@ func TestRespondRejectsRepeatedHelloOnly(t *testing.T) {
 		t.Fatal("只重发 Hello 被判成功 —— 假成功回归了")
 	}
 }
+
+// TestRespondOneWayHoleThenRelayEligible 模拟生产现场的完整形态：
+// 客户端处于对称 NAT 后 —— 它的 Hello 能到节点，但节点回给它的任何包都被丢弃
+// （用一个"只发不收"的客户端 socket 模拟：它把 Hello 发出去，但节点回的 Ack
+// 打到一个根本没人监听的地址上）。
+//
+// 修复前：节点判 success，客户端拿到一条死隧道，中继永不接管（生产实证 20 次）。
+// 修复后：节点判 failed —— 这正是让中继回退得以接管的前提。
+func TestRespondOneWayHoleThenRelayEligible(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	meta := testMetadata()
+	puncher, serverAddr := newServer(t, ctx)
+
+	// sender 用于发 Hello；节点会把 Ack 回到 sender 的源地址。
+	// 我们立刻关闭 sender 并改用另一只 socket 继续发 —— 于是节点回的 Ack
+	// 落到一个已关闭的端口(ICMP unreachable/丢弃)，等价于对称 NAT 无映射。
+	sender, _ := mustUDP(t)
+	hello, _ := EncodePunchPacket(PunchHello, meta)
+
+	go func() {
+		time.Sleep(120 * time.Millisecond)
+		for i := 0; i < 25; i++ {
+			// 每次换一只新 socket 发 Hello —— 精确复刻对称 NAT 每次源端口都不同、
+			// 节点朝旧端口回的 Ack 永远送不回去（生产实测 20 次源端口全不同）。
+			s, err := net.ListenUDP("udp4", &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1)})
+			if err != nil {
+				return
+			}
+			_, _ = s.WriteToUDPAddrPort(hello, serverAddr)
+			_ = s.Close() // 立刻关闭：节点回的 Ack 无处可去
+			time.Sleep(100 * time.Millisecond)
+		}
+	}()
+	_ = sender.Close()
+
+	respCtx, respCancel := context.WithTimeout(ctx, 4*time.Second)
+	defer respCancel()
+	result, err := puncher.Respond(respCtx, "attempt-symmetric-nat", nil, meta, true)
+	if err == nil {
+		t.Fatalf("对称 NAT 单向洞被判成功(peer=%v) —— 这正是生产上 20 次假成功的形态", result.PeerAddr)
+	}
+	t.Logf("符合预期：单向洞判失败 (%v) ⇒ 中继回退可接管", err)
+}
