@@ -24,7 +24,7 @@ import (
 	E "github.com/sagernet/sing/common/exceptions"
 	"github.com/sagernet/sing/service"
 
-	otunrealm "github.com/antsbtw/otun-s/transport/realm"
+	otunrealm "github.com/sagernet/sing-box/transport/realm"
 )
 
 // BuildConfig translates option.RealmOptions into otun-s realm.Config using the

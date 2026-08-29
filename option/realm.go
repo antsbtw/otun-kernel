@@ -13,7 +13,8 @@ import "github.com/sagernet/sing/common/json/badoption"
 // When an outbound's Realm is non-nil, the protocol does NOT dial server /
 // server_port directly; instead it punches a hole to the rendezvous (ServerURL,
 // Token, RealmID) and runs its handshake over that hole via the OTun overlay
-// glue (github.com/antsbtw/otun-s). When Realm is nil the outbound behaves
+// glue (本仓 transport/realm + overlay/*，2026-07-30 已从 otun-s 归位到这里；
+// 只有共用线格式包 underlay 仍在 otun-s)。When Realm is nil the outbound behaves
 // exactly as upstream — non-realm packages are unaffected.
 //
 // Fields mirror Hysteria2Realm verbatim so the config surface is uniform across

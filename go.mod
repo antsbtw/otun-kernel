@@ -178,3 +178,5 @@ require (
 // types passed across the kernel↔overlay boundary are identical (no type-identity
 // mismatch). This fork IS that version + realm wiring.
 replace github.com/sagernet/sing-box => ./
+
+replace github.com/sagernet/sing-quic => ./third_party/sing-quic

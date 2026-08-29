@@ -12,8 +12,8 @@ import (
 	E "github.com/sagernet/sing/common/exceptions"
 	M "github.com/sagernet/sing/common/metadata"
 
-	otunss "github.com/antsbtw/otun-s/overlay/shadowsocks"
-	otunrealmlib "github.com/antsbtw/otun-s/transport/realm"
+	otunss "github.com/sagernet/sing-box/overlay/shadowsocks"
+	otunrealmlib "github.com/sagernet/sing-box/transport/realm"
 )
 
 // realmDialer dials a FRESH Shadowsocks-over-realm conn per call. Like Trojan, a

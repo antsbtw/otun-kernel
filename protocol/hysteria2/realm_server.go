@@ -53,7 +53,14 @@ type realmSession struct {
 	realmID   string
 	username  string
 	addresses []string
-	expires   time.Time
+	// relay 是节点在注册/心跳时上报的中继地址（RELAY_FALLBACK_DESIGN.md §3.3bis）。
+	//
+	// ★由**节点**上报、会合面只做转发，而不是会合面自己配一份：中继地址本就随
+	// manager 的配置下发链路到达节点（realm_egress.relay_addresses → agent →
+	// egress.Config），会合面再配一份就成了同一事实的第二个真源，必然漂移。
+	// 会合面在这里的角色与它对 addresses 的角色完全一致：撮合、转发，不持有配置。
+	relay   []string
+	expires time.Time
 	events    chan realmEvent
 	timer     *time.Timer
 	done      chan struct{}
@@ -260,6 +267,7 @@ func (s *server) handleRegister(w http.ResponseWriter, r *http.Request) {
 	id := chi.URLParam(r, "id")
 	var req struct {
 		Addresses []string `json:"addresses"`
+		Relay     []string `json:"relay,omitempty"`
 	}
 	err := render.DecodeJSON(r.Body, &req)
 	if err != nil {
@@ -272,6 +280,16 @@ func (s *server) handleRegister(w http.ResponseWriter, r *http.Request) {
 		render.Status(r, http.StatusBadRequest)
 		render.JSON(w, r, render.M{"error": "bad_request", "message": err.Error()})
 		return
+	}
+	// 中继地址与打洞地址同一套校验（数量上限 + ip:port 格式）。
+	// 老节点不带此字段 → nil → 后续 /connect 不下发 relay，客户端不触发回退。
+	if req.Relay != nil {
+		err = validateAddresses(req.Relay)
+		if err != nil {
+			render.Status(r, http.StatusBadRequest)
+			render.JSON(w, r, render.M{"error": "bad_request", "message": err.Error()})
+			return
+		}
 	}
 	s.access.Lock()
 	if _, exists := s.realms[id]; exists {
@@ -299,6 +317,7 @@ func (s *server) handleRegister(w http.ResponseWriter, r *http.Request) {
 		realmID:   id,
 		username:  user.name,
 		addresses: append([]string(nil), req.Addresses...),
+		relay:     append([]string(nil), req.Relay...),
 		expires:   time.Now().Add(sessionTTL),
 		events:    make(chan realmEvent, eventChannelSize),
 		done:      make(chan struct{}),
@@ -331,6 +350,7 @@ func (s *server) handleHeartbeat(w http.ResponseWriter, r *http.Request) {
 	sess := r.Context().Value(contextKeySession).(*realmSession)
 	var req struct {
 		Addresses []string `json:"addresses"`
+		Relay     []string `json:"relay,omitempty"`
 	}
 	err := render.DecodeJSON(r.Body, &req)
 	if err != nil && !errors.Is(err, io.EOF) {
@@ -346,10 +366,22 @@ func (s *server) handleHeartbeat(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 	}
+	if req.Relay != nil {
+		err = validateAddresses(req.Relay)
+		if err != nil {
+			render.Status(r, http.StatusBadRequest)
+			render.JSON(w, r, render.M{"error": "bad_request", "message": err.Error()})
+			return
+		}
+	}
 	s.access.Lock()
 	sess.expires = time.Now().Add(sessionTTL)
 	if req.Addresses != nil {
 		sess.addresses = append([]string(nil), req.Addresses...)
+	}
+	// 心跳也更新中继地址：配置变更（加/撤中继）无需等节点重新注册即可生效。
+	if req.Relay != nil {
+		sess.relay = append([]string(nil), req.Relay...)
 	}
 	sess.timer.Reset(sessionTTL)
 	s.access.Unlock()
@@ -430,6 +462,9 @@ func (s *server) handleConnect(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	serverAddresses := append([]string(nil), sess.addresses...)
+	// ★中继地址与打洞地址【一起】下发（§3.3bis）：客户端打洞失败是本地 10s 超时，
+	// 它不会回头再问会合面，等失败再问要多一个往返。一起发 = 零额外往返。
+	relayAddresses := append([]string(nil), sess.relay...)
 	s.access.Unlock()
 
 	respCh, ready := s.registerPending(sess, req.Nonce)
@@ -467,11 +502,17 @@ func (s *server) handleConnect(w http.ResponseWriter, r *http.Request) {
 	case <-r.Context().Done():
 		return
 	}
-	render.JSON(w, r, render.M{
+	response := render.M{
 		"addresses": serverAddresses,
 		"nonce":     req.Nonce,
 		"obfs":      req.Obfs,
-	})
+	}
+	// 只在节点确实配了中继时才带此字段：老客户端忽略未知字段，新客户端见空即
+	// 不触发回退（行为与改动前逐字节一致）。
+	if len(relayAddresses) > 0 {
+		response["relay"] = relayAddresses
+	}
+	render.JSON(w, r, response)
 }
 
 func (s *server) handleConnectResponse(w http.ResponseWriter, r *http.Request) {
