@@ -1,18 +1,31 @@
-name: Build libbox.aar
+name: Build libbox
 
 # 为什么存在：中国侧测试机（realm-cn-01 上的安卓探针机）与开发机之间只有一条
 # ~20KB/s 的 CF Tunnel，传 97MB 的 aar 要 80 分钟；而该机直连 GitHub 有 ~1.2MB/s。
 # 且它没有 NDK、dl.google.com 不可达。⇒ 把编译放到 CI，两边都不传大文件。
 #
 # 手动触发（workflow_dispatch）为主：客户端内核改动后按需出包，不占用每次 push。
+#
+# ★ 两个客户端各一个 job（2026-09-18 增补 apple）：
+#   - android → libbox.aar        （ubuntu runner + NDK）
+#   - apple   → Libbox.xcframework（**必须 macos runner**，gomobile bind 要 Xcode，
+#                                   ubuntu 上编不出来，这不是配置问题是工具链硬约束）
+# 两个 job 互不依赖、并行跑：一个平台的工具链炸了不该挡住另一个出包。
+# 内核改动（S3/B4 这类）对两端同时生效，只出 aar 会让 Apple 侧静默停留在旧内核 ——
+# 实测 OTun-M-realm2/Libbox.xcframework 停在 2026-08-18，早于 S3，就是这么落下的。
 
 on:
   workflow_dispatch:
     inputs:
       debug:
-        description: "构建 debug 版（内核日志落 logcat，供排查用）"
+        description: "构建 debug 版（内核日志落 logcat/Console，供排查用）"
         type: boolean
         default: true
+      platform:
+        description: "出哪个平台的包"
+        type: choice
+        options: [both, android, apple]
+        default: both
   push:
     tags:
       - "libbox-*"
@@ -23,6 +36,11 @@ permissions:
 
 jobs:
   build:
+    name: android (aar)
+    # tag 触发时 inputs 为空，此时两个平台都出 —— 打 tag 是正式发版的语义。
+    if: >-
+      github.event_name != 'workflow_dispatch' ||
+      inputs.platform == 'both' || inputs.platform == 'android'
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
@@ -87,6 +105,57 @@ jobs:
             echo "::error::aar 未包含中继代码"; exit 1
           fi
 
+      # B4 埋点校验：上一步 grep 的中继符号 S3 就有，对 B4 **恒过** —— 验不出
+      # sink 有没有编进去。这里单独验 B4 的契约字段名。
+      #
+      # 🔴 为什么必须验：B4 的失败模式是**静默**的 —— 协议照常连通，只是 App
+      # 一条埋点都收不到，线上看起来一切正常，fail_stage 归因重新变成瞎猜
+      # （正是补 sink 之前的状态）。这种失败不验就发现不了。
+      #
+      # 🔴 为什么 grep 的是 JSON tag 而非函数名：tag 是**跨端契约**，App 按它
+      # 解析。函数名还在但 tag 改了，埋点照样对不上。验的就是真正会破约的那层。
+      #
+      # 🔴 匹配的是完整 tag 形态 `json:"name,omitempty"` 而非裸字段名，两个原因：
+      #  1. 裸名会误伤 —— Trace 结构体合法保留着 nat_type_guess（只有 Summary 改名），
+      #     按裸名查"旧名残留"会**恒假失败**；
+      #  2. 精确到 omitempty —— `json:"relay_used"` 与带 omitempty 的形态是两个串。
+      #
+      # ⚠️ 本步**不**检查"带 omitempty 的形态是否存在"：Trace 结构体合法地用着
+      # `json:"relay_used,omitempty"`（探针侧，那里该带），与 Summary 的
+      # `json:"relay_used"` 在 .so 里无法靠 grep 区分 —— 硬加这条会恒假失败。
+      # 「Summary 的 relay_used/outcome 不得带 omitempty」这条由 Go 用例
+      # TestSummaryRelayUsedPresentWhenFalse 保证，那里能看见类型，才验得准。
+      # 分工：CI 验"编进去了没"，Go 用例验"形状对不对"。
+      #
+      # ⚠️ 实测过一个反直觉现象：这些 tag 在 cmd/sing-box 里 grep **为 0** ——
+      # 那个二进制没人调 SetSummarySink，链接器把 Summary 的反射元数据整个 DCE 掉了。
+      # aar 不同：libbox.SetTelemetrySink 是 gomobile 导出面，必然可达，故 tag 保留。
+      # 若此步失败而 Verify relay symbols 通过，先怀疑的不是"漏编"，
+      # 而是 SetTelemetrySink 的导出链被切断（比如绑定面被裁剪）。
+      - name: Verify B4 telemetry fields
+        run: |
+          set -euo pipefail
+          # 对照组：上一步已确认 realm relay 非零，复用它验 grep 本身有效。
+          ctl=$(grep -ac "realm relay" /tmp/libbox.so || true)
+          if [ "$ctl" -eq 0 ]; then echo "::error::对照组失效，B4 校验不可信"; exit 1; fi
+
+          fail=0
+          # 契约字段必须在。-F 走字面量，tag 里的引号不参与正则解释。
+          for tag in \
+            'json:"inner_protocol,omitempty"' \
+            'json:"punch_nonce,omitempty"' \
+            'json:"kernel_tunnel_ready_ms,omitempty"' \
+            'json:"nat_type,omitempty"' \
+            'json:"relay_used"' \
+            'json:"outcome"' ; do
+            n=$(grep -acF "$tag" /tmp/libbox.so || true)
+            echo "  present? ${tag} = ${n}"
+            if [ "$n" -eq 0 ]; then fail=1; fi
+          done
+          if [ "$fail" -ne 0 ]; then
+            echo "::error::aar 缺 B4 契约字段（sink 可能未编入，App 将收不到任何埋点）"; exit 1
+          fi
+
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
@@ -116,3 +185,113 @@ jobs:
             debug: ${{ inputs.debug }}
             含中继回退（RELAY_FALLBACK_DESIGN.md）。校验已在 CI 内跑过：
             对照组 punch timeout 命中 + realm relay/OTRL 均非零。
+
+  # ---- Apple（iOS / iOS-sim / macOS / tvOS）-----------------------------------
+  #
+  # 🔴 必须 macos runner：gomobile bind -target ios,... 要调 Xcode 的 clang 与
+  # xcrun 出 .xcframework，ubuntu 上没有也装不了 —— 这是工具链硬约束，
+  # 不是能靠装包解决的配置问题。
+  build-apple:
+    name: apple (xcframework)
+    if: >-
+      github.event_name != 'workflow_dispatch' ||
+      inputs.platform == 'both' || inputs.platform == 'apple'
+    runs-on: macos-15
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: "1.25"
+          cache: true
+
+      # 与 android job 同源：版本随 go.mod 走，避免两端 gomobile 不一致。
+      - name: Install gomobile
+        run: |
+          set -euo pipefail
+          ver=$(go list -m -f '{{.Version}}' github.com/sagernet/gomobile)
+          echo "gomobile version from go.mod: $ver"
+          go install github.com/sagernet/gomobile/cmd/gomobile@"$ver"
+          go install github.com/sagernet/gomobile/cmd/gobind@"$ver"
+          ls -l "$(go env GOPATH)/bin/gobind" "$(go env GOPATH)/bin/gomobile"
+
+      # ⚠️ debug 模式下 buildApple() 只出 ios 一个 slice（见 build_libbox/main.go:206）；
+      # 非 debug 才出 ios,iossimulator,tvos,tvossimulator,macos 全套。
+      # 要交集成的包请用 debug=false，否则 Xcode 链接 macOS/模拟器目标会缺 slice。
+      - name: Build xcframework
+        run: |
+          set -euo pipefail
+          go run ./cmd/internal/build_libbox -target apple ${{ inputs.debug && '-debug' || '' }}
+          ls -ld Libbox.xcframework
+
+      # 产物校验：与 android job 同一手法（对照组 + 目标符号），验的是同一批事实。
+      # 取 ios-arm64 slice 做样本：真机跑的就是它。
+      - name: Verify relay + B4 symbols
+        run: |
+          set -euo pipefail
+          BIN=$(find Libbox.xcframework/ios-arm64 -name "Libbox" -type f | head -1)
+          if [ -z "$BIN" ]; then
+            # 非 framework 布局时回退找静态库
+            BIN=$(find Libbox.xcframework/ios-arm64 -name "*.a" | head -1)
+          fi
+          echo "sample slice: $BIN"
+          test -n "$BIN" || { echo "::error::找不到 ios-arm64 产物"; exit 1; }
+
+          ctl=$(grep -ac "punch timeout" "$BIN" || true)
+          relay=$(grep -ac "realm relay" "$BIN" || true)
+          echo "control(punch timeout)=$ctl  realm relay=$relay"
+          if [ "$ctl" -eq 0 ]; then echo "::error::对照组失效，校验不可信"; exit 1; fi
+          if [ "$relay" -eq 0 ]; then echo "::error::产物未包含中继代码"; exit 1; fi
+
+          # B4 契约字段（理由与 android job 的 Verify B4 telemetry fields 同，见那里注释）
+          fail=0
+          for tag in \
+            'json:"inner_protocol,omitempty"' \
+            'json:"punch_nonce,omitempty"' \
+            'json:"kernel_tunnel_ready_ms,omitempty"' \
+            'json:"nat_type,omitempty"' \
+            'json:"relay_used"' \
+            'json:"outcome"' ; do
+            n=$(grep -acF "$tag" "$BIN" || true)
+            echo "  present? ${tag} = ${n}"
+            if [ "$n" -eq 0 ]; then fail=1; fi
+          done
+          if [ "$fail" -ne 0 ]; then
+            echo "::error::产物缺 B4 契约字段（sink 可能未编入，App 将收不到任何埋点）"; exit 1
+          fi
+
+      # xcframework 是目录，必须打包才能当 Release 资产传。
+      - name: Package xcframework
+        run: |
+          set -euo pipefail
+          zip -qry Libbox.xcframework.zip Libbox.xcframework
+          ls -l Libbox.xcframework.zip
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: libbox-xcframework-${{ github.sha }}
+          path: Libbox.xcframework.zip
+          retention-days: 14
+          compression-level: 0
+
+      # 与 aar 同一个固定 tag、同样覆盖式：Apple 壳（OTun-M-realm2）取包也走
+      # 免 token 的 Release 直链：
+      #   https://github.com/antsbtw/otun-kernel/releases/download/libbox-latest/Libbox.xcframework.zip
+      # 🔴 两个 job 发同一个 tag 是刻意的：同一份内核出的两端包应当同版本同处取，
+      # 避免"Android 是新的、Apple 还是旧的"这类静默偏差（正是 08-18 那次的形态）。
+      - name: Publish to Release
+        uses: softprops/action-gh-release@v1
+        with:
+          tag_name: libbox-latest
+          name: libbox (latest build)
+          prerelease: true
+          files: Libbox.xcframework.zip
+          body: |
+            commit: ${{ github.sha }}
+            branch: ${{ github.ref_name }}
+            debug: ${{ inputs.debug }}
+            含 S3（对称 NAT 打洞/中继竞速）+ B4（realm 连接遥测四字段）。
+            校验已在 CI 内跑过：对照组命中 + realm relay + B4 契约字段均非零。
