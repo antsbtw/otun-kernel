@@ -37,8 +37,15 @@ func ProbeTraceEnabled() bool {
 // 返回 nil 是正常路径而非错误：调用方**不需要判空**，直接把它交给
 // PunchTraced 和 trace.XxxDone() 即可 —— nil receiver 全是 no-op。
 // 这正是让「生产路径零改动」成立的设计。
+//
+// ★ 两个开启条件（2026-08-18 增补第二个）：
+//  1. OTUN_PROBE_TRACE=1 —— 探针进程用，只有起进程的人能设；
+//  2. 注册了进程内 sink（SetSummarySink/SetTraceSink）—— 生产 App 用，
+//     因为 App 里没人能设环境变量。见 probe_sink.go 的立意。
+//
+// 两者都没有时仍返回 nil，生产默认路径逐字节不变。
 func Session(realmID string, protocol string) *Trace {
-	if !ProbeTraceEnabled() {
+	if !ProbeTraceEnabled() && !TraceSinkEnabled() {
 		return nil
 	}
 	return NewTrace(realmID, protocol)
@@ -63,8 +70,18 @@ func SessionOr(injected *Trace, realmID string, protocol string) *Trace {
 //
 // 输出走 logger.Info：prober 读的是子进程的 stderr/stdout 合并流，
 // sing-box 的日志默认写到那里，前缀 OTUN_PROBE_TRACE_V1 保证可精确切分。
+// ★ 两条出口，互不依赖（2026-08-18 增补 sink）：
+//   - 日志行：prober 抓 stdout 用，行为逐字节不变；
+//   - 进程内 sink：生产 App 用，见 probe_sink.go。
+//
+// 🔴 sink 的派发**不能**放在 `log == nil` 的早退之后 —— 生产壳侧完全可能
+// 传 logger.NOP() 或不配日志，那时埋点照样必须送达。两条出口各判各的前置条件。
 func Emit(log logger.Logger, trace *Trace) {
-	if trace == nil || log == nil {
+	if trace == nil {
+		return
+	}
+	dispatch(trace)
+	if log == nil {
 		return
 	}
 	encoded, err := json.Marshal(trace)

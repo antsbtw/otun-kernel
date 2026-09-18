@@ -90,8 +90,13 @@ func Dial(ctx context.Context, opts Options) (*Client, error) {
 	// punchFn 的选择：埋点开启 **或** 指定了非默认路径（探针）时，走带 trace/mode
 	// 的版本；两者都不涉及时保持 realm.Punch 原样（生产惰性打洞逐字节不变）。
 	// mode 经闭包捕获（punchFn 签名固定，不能加参）。
+	// 🔴 TUIC 是唯一在 overlay 层显式判开关的协议（另外四个无条件走 SessionOr，
+	// 靠 Session 返回 nil 实现零影响）。所以生产 sink 的开关必须在这里**也**认一次，
+	// 否则 App 注册了 sink 却唯独 tuic 不出埋点 —— 六协议的尺子就不齐了。
+	// 判 TraceSinkEnabled() 而非 Session()!=nil：此处只决定走哪条 punchFn，
+	// 真正的 Trace 由闭包内每次惰性打洞各自创建（见上方注释）。
 	punchFn := realm.Punch
-	if realm.ProbeTraceEnabled() || opts.Mode != realm.ModeNormal || opts.Trace != nil {
+	if realm.ProbeTraceEnabled() || realm.TraceSinkEnabled() || opts.Mode != realm.ModeNormal || opts.Trace != nil {
 		mode := opts.Mode
 		injected := opts.Trace
 		punchFn = func(ctx context.Context, cfg realm.Config, realmID string) (*realm.PunchedConn, error) {
