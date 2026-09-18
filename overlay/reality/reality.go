@@ -91,7 +91,7 @@ func Dial(ctx context.Context, opts Options) (*Client, error) {
 		return nil, E.Cause(err, "create vless client")
 	}
 	// 埋点：未开启时 trace 为 nil，以下所有 trace 调用都是 no-op（生产路径零影响）。
-	trace := realm.SessionOr(opts.Trace, opts.RealmID, "vless-reality")
+	trace := realm.SessionOr(opts.Trace, opts.RealmID, "reality")
 	punched, err := realm.PunchTracedWithMode(ctx, opts.Realm, opts.RealmID, trace, opts.Mode)
 	if err != nil {
 		// 阶段归类已在 PunchTraced 内部完成（stun/rendezvous/candidate/punch），

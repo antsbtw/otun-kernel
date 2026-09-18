@@ -145,3 +145,179 @@ func TestEmitNilTraceDoesNotDispatch(t *testing.T) {
 		t.Fatal("nil trace must not reach the sink")
 	}
 }
+
+// ---- B4 契约字段（2026-09-18）----------------------------------------------
+
+// 契约字段名与取值：JSON 形状是**跨端契约**，改名即破约，故逐字段钉死。
+// 🔴 这里断言的是 JSON tag 而非 Go 字段名：App 侧解析的是前者，
+// 改 Go 字段名不会破坏它们，改 tag 会 —— 护栏必须挡在真正的破约面上。
+func TestSummaryContractFieldNames(t *testing.T) {
+	resetSinks(t)
+	var got Summary
+	SetSummarySink(func(s Summary) { got = s })
+
+	trace := NewTrace("egress-nj-01", "reality")
+	trace.Punch.NATTypeGuess = NATTypeSymmetric
+	trace.Nonce = "0123456789abcdef0123456789abcdef"
+	trace.HandshakeDone()
+	Emit(nil, trace)
+
+	encoded, err := json.Marshal(got)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var decoded map[string]any
+	if err := json.Unmarshal(encoded, &decoded); err != nil {
+		t.Fatal(err)
+	}
+
+	for _, key := range []string{
+		"inner_protocol", "nat_type", "punch_nonce",
+		"outcome", "kernel_tunnel_ready_ms", "relay_used",
+	} {
+		if _, ok := decoded[key]; !ok {
+			t.Errorf("契约字段 %q 缺失: %s", key, encoded)
+		}
+	}
+	// 旧名不得残留 —— 同名即同义的反面：旧名还在就等于两套口径并存。
+	for _, stale := range []string{"protocol", "nat_type_guess", "tunnel_ready_ms"} {
+		if _, ok := decoded[stale]; ok {
+			t.Errorf("旧字段名 %q 不该再出现: %s", stale, encoded)
+		}
+	}
+	if decoded["inner_protocol"] != "reality" {
+		t.Errorf("inner_protocol 应为 reality(非 vless-reality), 实得 %v", decoded["inner_protocol"])
+	}
+}
+
+// outcome 由 fail_stage 派生：空 = success，非空 = failed。
+//
+// 🔴 中继救回的那一行是本用例的重点：fail_stage 仍是 punch,故 outcome=failed,
+// 但 relay_used=true。两个口径不合并——合并会让「打洞成功率」与「连接成功率」
+// 互相污染(见 Trace.RelayUsed 注释)。后端按 relay_used 单独统计「被救回」。
+func TestSummaryOutcomeDerivation(t *testing.T) {
+	resetSinks(t)
+	for _, tc := range []struct {
+		name    string
+		prepare func(*Trace)
+		want    string
+	}{
+		{"握手完成即 success", func(tr *Trace) { tr.HandshakeDone() }, OutcomeSuccess},
+		{"失败带 fail_stage", func(tr *Trace) { tr.Fail(FailStagePunch, errors.New("boom")) }, OutcomeFailed},
+		{"中继救回仍记 failed", func(tr *Trace) {
+			tr.Fail(FailStagePunch, errors.New("no hole"))
+			tr.RelayEstablished("203.0.113.7:9000")
+		}, OutcomeFailed},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			var got Summary
+			SetSummarySink(func(s Summary) { got = s })
+			trace := NewTrace("r", "tuic")
+			tc.prepare(trace)
+			Emit(nil, trace)
+			if got.Outcome != tc.want {
+				t.Errorf("outcome = %q, want %q (fail_stage=%q)", got.Outcome, tc.want, got.FailStage)
+			}
+		})
+	}
+}
+
+// nat_type 未判定时**留空**,不发 "unknown"(后端 2026-09-18 拍板)。
+// 同一件事两种表达会逼 App 侧既判空又判串,那是自造分叉。
+func TestSummaryNATTypeUnknownStaysEmpty(t *testing.T) {
+	resetSinks(t)
+	var got Summary
+	SetSummarySink(func(s Summary) { got = s })
+
+	trace := NewTrace("r", "trojan")
+	trace.Punch.NATTypeGuess = NATTypeUnknown
+	trace.HandshakeDone()
+	Emit(nil, trace)
+
+	if got.NATTypeGuess != "" {
+		t.Errorf("nat_type 未判定应留空, 实得 %q", got.NATTypeGuess)
+	}
+	encoded, _ := json.Marshal(got)
+	if strings.Contains(string(encoded), "nat_type") {
+		t.Errorf("未判定时不该输出 nat_type 字段: %s", encoded)
+	}
+}
+
+// kernel_tunnel_ready_ms 只在隧道真建起来时有值。
+//
+// 🔴 失败时留 nil 而非 0:0 会被统计成「秒开」,比缺字段坏得多。
+func TestSummaryKernelTunnelReadyMs(t *testing.T) {
+	resetSinks(t)
+
+	t.Run("成功有值", func(t *testing.T) {
+		var got Summary
+		SetSummarySink(func(s Summary) { got = s })
+		trace := NewTrace("r", "vmess")
+		trace.HandshakeDone()
+		Emit(nil, trace)
+		if got.KernelTunnelReadyMs == nil {
+			t.Fatal("隧道建立后 kernel_tunnel_ready_ms 不应为 nil")
+		}
+	})
+
+	t.Run("失败留空", func(t *testing.T) {
+		var got Summary
+		SetSummarySink(func(s Summary) { got = s })
+		trace := NewTrace("r", "vmess")
+		trace.Fail(FailStageHandshake, errors.New("nope"))
+		Emit(nil, trace)
+		if got.KernelTunnelReadyMs != nil {
+			t.Errorf("未就绪却给了 kernel_tunnel_ready_ms = %d", *got.KernelTunnelReadyMs)
+		}
+	})
+}
+
+// punch_nonce 是双端 join 键,必须原样带出 —— 缺它双端数据只能按时间窗猜。
+// 它是随机数不是地址,不违反隐私边界(见 Summary.Nonce 注释)。
+func TestSummaryCarriesPunchNonce(t *testing.T) {
+	resetSinks(t)
+	var got Summary
+	SetSummarySink(func(s Summary) { got = s })
+
+	const nonce = "0123456789abcdef0123456789abcdef"
+	trace := NewTrace("r", "shadowsocks")
+	trace.Nonce = nonce
+	trace.HandshakeDone()
+	Emit(nil, trace)
+
+	if got.Nonce != nonce {
+		t.Errorf("punch_nonce = %q, want %q", got.Nonce, nonce)
+	}
+}
+
+// 🔴 直连打洞成功时 relay_used 必须仍以 false **出现在 JSON 里**。
+//
+// 这是 omitempty 的经典陷阱:bool 零值会让字段整个消失,而前端判空用 assertNull
+// 口径,字段消失会被读成"没有数据",与"没用中继"是两回事 —— 正是契约 §2
+// ⚠️「没这条事件 ≠ relay_used=false」要避免的混淆。加字段时若顺手抄了
+// omitempty,本用例是唯一能抓住它的护栏。
+func TestSummaryRelayUsedPresentWhenFalse(t *testing.T) {
+	resetSinks(t)
+	var got Summary
+	SetSummarySink(func(s Summary) { got = s })
+
+	trace := NewTrace("r", "reality")
+	trace.HandshakeDone() // 直连打洞成功,从未用中继
+	Emit(nil, trace)
+
+	encoded, err := json.Marshal(got)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var decoded map[string]any
+	if err := json.Unmarshal(encoded, &decoded); err != nil {
+		t.Fatal(err)
+	}
+	relayUsed, ok := decoded["relay_used"]
+	if !ok {
+		t.Fatalf("relay_used 在直连成功时消失了(omitempty 陷阱): %s", encoded)
+	}
+	if relayUsed != false {
+		t.Errorf("relay_used = %v, want false", relayUsed)
+	}
+}
