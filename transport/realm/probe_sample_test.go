@@ -78,7 +78,7 @@ func TestProbeTraceRealPathFiveProtocols(t *testing.T) {
 	}
 	t.Setenv(realm.ProbeTraceEnv, "1")
 
-	protocols := []string{"vless-reality", "trojan", "vmess", "shadowsocks", "tuic"}
+	protocols := []string{"reality", "trojan", "vmess", "shadowsocks", "tuic"}
 
 	const token = "sample-token"
 	stun := realmtest.STUN(t)

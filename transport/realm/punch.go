@@ -192,6 +192,26 @@ func PunchTracedWithMode(ctx context.Context, cfg Config, realmID string, trace 
 	trace.NonceNegotiated(response.PunchMetadata)
 	trace.CandidatesComputed(response.Addresses)
 
+	// ★S3（relay_race.go）：对称 NAT + 会合面下发了中继 + ModeNormal 时，打洞与
+	// 中继**并发竞速**，不再先烧满 10s 打洞超时才回退。判据 guessNATType 用的是本地
+	// STUN 反射地址（localAddresses）——多个映射端口不一致 = 对称 NAT，打洞大概率失败。
+	// 其余情况（cone/unknown NAT、无中继、探针 mode）恒走下方原路径，逐字节不变。
+	if mode == ModeNormal && len(response.Relay) > 0 && guessNATType(localAddresses) == NATTypeSymmetric {
+		conn, viaRelay, raceErr := racePunchAndRelay(ctx, cfg, surviving, response.Addresses, response.Relay, response.PunchMetadata)
+		if raceErr != nil {
+			// 两路都失败：归 punch（对称 NAT 下打洞失败是真实卡点），与原路径口径一致。
+			trace.Fail(FailStagePunch, raceErr)
+			return nil, raceErr
+		}
+		if viaRelay {
+			trace.RelayEstablished(conn.PeerAddr.String())
+		} else {
+			// 打洞在对称 NAT 下仍撞通（端口预测命中）：按打洞成功记，出口是本地直连。
+			trace.PunchDone(squic.PunchResult{PeerAddr: conn.PeerAddr.AddrPort()}, "", "")
+		}
+		return conn, nil
+	}
+
 	winner, result, err := racePunch(ctx, surviving, response.Addresses, response.PunchMetadata)
 	if err != nil {
 		// candidate 与 punch 的区分：会合面没给出任何可用地址 → candidate
