@@ -43,8 +43,15 @@ jobs:
       inputs.platform == 'both' || inputs.platform == 'android'
     runs-on: ubuntu-latest
     steps:
+      # 🔴 fetch-depth: 0 不是可选项:build_libbox 用 `git describe --tags` 推
+      # constant.Version(经 ReadTag),浅克隆(checkout 默认 depth=1、且不取 tag)会让
+      # describe 失败 → Version 回落 "unknown",产物里就查不到任何版本/提交号。
+      # 取全历史后 Version 形如 "0.0.0-<short sha>",壳侧诊断包的 kernel_version
+      # 靠那个后缀就能一眼核对装的是哪个提交。
       - name: Checkout
         uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
 
       - name: Setup Go
         uses: actions/setup-go@v5
@@ -198,8 +205,15 @@ jobs:
       inputs.platform == 'both' || inputs.platform == 'apple'
     runs-on: macos-15
     steps:
+      # 🔴 fetch-depth: 0 不是可选项:build_libbox 用 `git describe --tags` 推
+      # constant.Version(经 ReadTag),浅克隆(checkout 默认 depth=1、且不取 tag)会让
+      # describe 失败 → Version 回落 "unknown",产物里就查不到任何版本/提交号。
+      # 取全历史后 Version 形如 "0.0.0-<short sha>",壳侧诊断包的 kernel_version
+      # 靠那个后缀就能一眼核对装的是哪个提交。
       - name: Checkout
         uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
 
       - name: Setup Go
         uses: actions/setup-go@v5
