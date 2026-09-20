@@ -35,6 +35,7 @@ import (
 	"net"
 	"net/netip"
 	"sync"
+	"time"
 
 	otunsrealm "github.com/antsbtw/otun-s/transport/realm"
 
@@ -387,6 +388,9 @@ func listenPacket(ctx context.Context, cfg Config, addr M.Socksaddr) (net.Packet
 	return net.ListenUDP("udp", net.UDPAddrFromAddrPort(addr.AddrPort()))
 }
 
+// familyDiscoverGrace:一个地址族先拿到 STUN 反射地址后,最多再等另一族这么久(见 discoverFamilies)。
+const familyDiscoverGrace = 300 * time.Millisecond
+
 func discoverFamilies(ctx context.Context, cfg Config, families []*familyConn) ([]*familyConn, []netip.AddrPort, error) {
 	var needIPv4, needIPv6 bool
 	for _, f := range families {
@@ -404,26 +408,57 @@ func discoverFamilies(ctx context.Context, cfg Config, families []*familyConn) (
 		return nil, nil, E.Cause(err, "resolve STUN servers")
 	}
 	type discoverResult struct {
+		idx   int
 		addrs []netip.AddrPort
 		err   error
 	}
-	results := make([]discoverResult, len(families))
-	var wg sync.WaitGroup
+	// ★各地址族并发探测,但**不等最慢的那一族**:某一族先拿到反射地址后,另一族最多再等
+	// familyDiscoverGrace;到点没结果就取消它(cancel ctx + 把读 deadline 拨到现在让 ReadFrom
+	// 立刻返回),按"该族不可用"处理。否则下发了 v6 STUN 后,"有 v6 地址但 v6 出不去"的设备
+	// (ULA-only / 运营商 v6 黑洞)每次连接都要陪 v6 族跑满 STUN 重试(0.5+2+4s):
+	// 09-20 realm-cn-01 实测 v4-only 3.8s → v4+v6 8.1s。纯 v4 设备(v6 发包即 ENETUNREACH)
+	// 与双栈正常设备(两族几百毫秒内都回)不受本逻辑影响。
+	resultCh := make(chan discoverResult, len(families))
+	cancels := make([]context.CancelFunc, len(families))
 	for i, f := range families {
-		wg.Add(1)
+		familyCtx, cancel := context.WithCancel(ctx)
+		cancels[i] = cancel
 		go func() {
-			defer wg.Done()
 			servers := make([]netip.AddrPort, 0, len(stunServers))
 			for _, server := range stunServers {
 				if server.Addr().Is4() == f.ipv4 {
 					servers = append(servers, server)
 				}
 			}
-			addrs, discoverErr := squic.Discover(ctx, f.conn, servers)
-			results[i] = discoverResult{addrs: addrs, err: discoverErr}
+			addrs, discoverErr := squic.Discover(familyCtx, f.conn, servers)
+			resultCh <- discoverResult{idx: i, addrs: addrs, err: discoverErr}
 		}()
 	}
-	wg.Wait()
+	results := make([]discoverResult, len(families))
+	received := make([]bool, len(families))
+	var grace <-chan time.Time
+	for done := 0; done < len(families); {
+		select {
+		case r := <-resultCh:
+			results[r.idx] = r
+			received[r.idx] = true
+			done++
+			if r.err == nil && grace == nil && done < len(families) {
+				grace = time.After(familyDiscoverGrace)
+			}
+		case <-grace:
+			grace = nil
+			for i, f := range families {
+				if !received[i] {
+					cancels[i]()
+					_ = f.conn.SetReadDeadline(time.Now())
+				}
+			}
+		}
+	}
+	for _, cancel := range cancels {
+		cancel()
+	}
 	var surviving []*familyConn
 	var union []netip.AddrPort
 	var errs []error
