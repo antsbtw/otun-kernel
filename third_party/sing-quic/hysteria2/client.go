@@ -399,6 +399,10 @@ func (c *Client) realmOpenFamilies(ctx context.Context) ([]*realmFamilyConn, err
 	return families, nil
 }
 
+// realmFamilyDiscoverGrace:一个地址族先拿到 STUN 反射地址后,最多再等另一族这么久
+// (见 realmDiscoverFamilies;取值与 kernel transport/realm familyDiscoverGrace 一致)。
+const realmFamilyDiscoverGrace = 300 * time.Millisecond
+
 func (c *Client) realmDiscoverFamilies(ctx context.Context, families []*realmFamilyConn) ([]*realmFamilyConn, []netip.AddrPort, error) {
 	var needIPv4, needIPv6 bool
 	for _, family := range families {
@@ -416,26 +420,61 @@ func (c *Client) realmDiscoverFamilies(ctx context.Context, families []*realmFam
 		return nil, nil, E.Cause(err, "resolve STUN servers")
 	}
 	type discoverResult struct {
+		idx   int
 		addrs []netip.AddrPort
 		err   error
 	}
-	results := make([]discoverResult, len(families))
-	var wg sync.WaitGroup
+	// ★各地址族并发探测,但**不等最慢的那一族**:某一族先拿到反射地址后,另一族最多再等
+	// realmFamilyDiscoverGrace;到点没结果就取消它(cancel ctx + 把读 deadline 拨到现在让
+	// ReadFrom 立刻返回),按"该族不可用"处理。
+	//
+	// 🔴 与 kernel transport/realm discoverFamilies 逐行对齐(e2ada7f,09-20)。当时只修了那边,
+	// 漏了 hy2 这份老客户端实现 —— 而住宅面恰恰走 hy2。后果:策略下发 v6 STUN 后,"有 v6 地址
+	// 但 v6 出不去"的设备(ULA-only / 运营商 v6 黑洞)每次连接都陪 v6 族跑满 STUN 重试
+	// (0.5+2+4s),realm-cn-01 实测 v4-only 3.8s → v4+v6 8.1s。10-14 给 (ANY,JP) 加 v6 STUN
+	// 后日本区 hy2 用户已暴露在这个代价下;(ANY,ANY) 加 v6 前必须先有本修复。
+	// 纯 v4 设备(v6 发包即 ENETUNREACH)与双栈正常设备(两族几百毫秒内都回)行为不变。
+	resultCh := make(chan discoverResult, len(families))
+	cancels := make([]context.CancelFunc, len(families))
 	for i, family := range families {
-		wg.Add(1)
+		familyCtx, cancel := context.WithCancel(ctx)
+		cancels[i] = cancel
 		go func() {
-			defer wg.Done()
 			servers := make([]netip.AddrPort, 0, len(stunServers))
 			for _, server := range stunServers {
 				if server.Addr().Is4() == family.ipv4 {
 					servers = append(servers, server)
 				}
 			}
-			addrs, discoverErr := realm.Discover(ctx, family.conn, servers)
-			results[i] = discoverResult{addrs: addrs, err: discoverErr}
+			addrs, discoverErr := realm.Discover(familyCtx, family.conn, servers)
+			resultCh <- discoverResult{idx: i, addrs: addrs, err: discoverErr}
 		}()
 	}
-	wg.Wait()
+	results := make([]discoverResult, len(families))
+	received := make([]bool, len(families))
+	var grace <-chan time.Time
+	for done := 0; done < len(families); {
+		select {
+		case r := <-resultCh:
+			results[r.idx] = r
+			received[r.idx] = true
+			done++
+			if r.err == nil && grace == nil && done < len(families) {
+				grace = time.After(realmFamilyDiscoverGrace)
+			}
+		case <-grace:
+			grace = nil
+			for i, family := range families {
+				if !received[i] {
+					cancels[i]()
+					_ = family.conn.SetReadDeadline(time.Now())
+				}
+			}
+		}
+	}
+	for _, cancel := range cancels {
+		cancel()
+	}
 	var surviving []*realmFamilyConn
 	var union []netip.AddrPort
 	var errs []error
