@@ -295,14 +295,19 @@ type realmFamilyConn struct {
 }
 
 func (c *Client) offerNewRealm(ctx context.Context) (*clientQUICConnection, error) {
+	obs := c.newDialObserver()
+	defer obs.Finish()
 	families, err := c.realmOpenFamilies(ctx)
 	if err != nil {
+		obs.Failed("stun", err)
 		return nil, err
 	}
 	surviving, localAddresses, err := c.realmDiscoverFamilies(ctx, families)
 	if err != nil {
+		obs.Failed("stun", err)
 		return nil, err
 	}
+	obs.STUNDiscovered(localAddresses)
 	closeSurviving := func() {
 		for _, family := range surviving {
 			_ = family.conn.Close()
@@ -311,18 +316,22 @@ func (c *Client) offerNewRealm(ctx context.Context) (*clientQUICConnection, erro
 	localMetadata, err := realm.GeneratePunchMetadata()
 	if err != nil {
 		closeSurviving()
+		obs.Failed("rendezvous", err)
 		return nil, E.Cause(err, "generate punch metadata")
 	}
 	response, err := c.controlClient.Connect(ctx, c.realmOptions.RealmID, localAddresses, localMetadata)
 	if err != nil {
 		closeSurviving()
+		obs.Failed("rendezvous", err)
 		return nil, E.Cause(err, "realm connect")
 	}
-	winner, result, err := c.realmRacePunch(ctx, surviving, response.Addresses, response.PunchMetadata)
+	obs.RendezvousDone(response.Addresses, response.PunchMetadata)
+	winner, result, err := c.realmRacePunch(ctx, surviving, response.Addresses, response.PunchMetadata, obs)
 	var peerAddr M.Socksaddr
 	var rawConn net.PacketConn
 	family := "relay"
 	if err != nil {
+		obs.Failed("punch", err)
 		// ★中继回退（RELAY_FALLBACK_DESIGN.md §3.1）：对称 NAT 下打洞必败，
 		// 改由客户端与节点各自主动出站连中继、按 nonce 对接。
 		//
@@ -342,9 +351,15 @@ func (c *Client) offerNewRealm(ctx context.Context) (*clientQUICConnection, erro
 		// realmRacePunch 失败时关闭了全部 socket，中继需要一只新的。
 		relayConn, listenErr := c.dialer.ListenPacket(ctx, M.SocksaddrFrom(netip.IPv4Unspecified(), 0))
 		if listenErr != nil {
+			obs.RelaySettled("", listenErr)
 			return nil, err
 		}
 		relayAddr, relayErr := realm.RaceRelayJoin(ctx, relayConn, response.Relay, response.PunchMetadata.Nonce)
+		if relayErr != nil {
+			obs.RelaySettled("", relayErr)
+		} else {
+			obs.RelaySettled(relayAddr.String(), nil)
+		}
 		if relayErr != nil {
 			_ = relayConn.Close()
 			return nil, err
@@ -355,6 +370,7 @@ func (c *Client) offerNewRealm(ctx context.Context) (*clientQUICConnection, erro
 		rawConn = winner.conn
 		peerAddr = M.SocksaddrFromNetIP(result.PeerAddr)
 		family = winner.family
+		obs.PunchSucceeded(winner.family, result)
 	}
 	packetConn := rawConn
 	if c.geckoPassword != "" {
@@ -364,8 +380,10 @@ func (c *Client) offerNewRealm(ctx context.Context) (*clientQUICConnection, erro
 	}
 	conn, err := c.authenticateAndWrap(ctx, packetConn, peerAddr)
 	if err != nil {
+		obs.Failed("handshake", err)
 		return nil, err
 	}
+	obs.HandshakeDone()
 	c.attachStallWatch(conn, family)
 	return conn, nil
 }
@@ -511,6 +529,7 @@ func (c *Client) realmRacePunch(
 	families []*realmFamilyConn,
 	peerAddresses []netip.AddrPort,
 	metadata realm.PunchMetadata,
+	obs dialObserver,
 ) (*realmFamilyConn, realm.PunchResult, error) {
 	raceCtx, raceCancel := context.WithCancel(ctx)
 	defer raceCancel()
@@ -523,6 +542,7 @@ func (c *Client) realmRacePunch(
 					peers = append(peers, peer)
 				}
 			}
+			obs.PunchAttempted(family.family, peers)
 			punchResult, punchErr := realm.Punch(raceCtx, family.conn, peers, metadata)
 			out <- realm.PunchOutcome[*realmFamilyConn]{Family: family, IPv4: family.ipv4, Result: punchResult, Err: punchErr}
 		}()

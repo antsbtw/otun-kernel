@@ -70,7 +70,7 @@ func init() {
 	notMemcTags = append(notMemcTags, "with_low_memory")
 	debugTags = append(debugTags, "debug")
 
-	// 排障用：允许从环境追加 build tag（如 otun_probe_trace 打开 hy2 打洞埋点）。
+	// 排障用：允许从环境追加 build tag。（hy2 打洞埋点 2026-10-15 起已进生产构建，不再需要 otun_probe_trace。）
 	// 不设则行为与之前完全一致 —— 默认构建零变化。
 	if extra := os.Getenv("OTUN_EXTRA_TAGS"); extra != "" {
 		for _, t := range strings.Split(extra, ",") {

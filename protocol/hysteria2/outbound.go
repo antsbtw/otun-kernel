@@ -113,9 +113,8 @@ func NewOutbound(ctx context.Context, router adapter.Router, logger log.ContextL
 			},
 			Logger: logger,
 		}
-		// 探针构建（-tags otun_probe_trace）下挂上发起端打洞观测；生产构建里
-		// attachProbeDialObserver 是空实现，realmOptions 一字不改。见
-		// probe_dial_observer.go 顶部的三层隔离说明。
+		// 挂上发起端建连观测（住宅面 punch_nonce / fail_stage 的数据源）。App 未订阅摘要、
+		// 探针开关未开时每次建连都拿到 nil 观测器，零开销。见 probe_dial_observer.go。
 		attachProbeDialObserver(realmOptions, options.Realm.RealmID)
 	}
 	networkList := options.Network.Build()

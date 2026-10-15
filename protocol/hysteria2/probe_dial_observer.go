@@ -1,27 +1,23 @@
-//go:build otun_probe_trace
-
 package hysteria2
 
-// probe_dial_observer.go —— 把 sing-quic 的发起端打洞观测接口（realm.DialObserver）
-// 接到 kernel 既有的 transport/realm.Trace 上，让 hy2 也产出七阶段埋点与 nonce。
+// probe_dial_observer.go —— 把 sing-quic 发起端建连观测接口(realm.DialObserver)翻译成
+// kernel 既有的 transport/realm.Trace,让住宅面 hy2 也产出 punch_nonce / fail_stage 等摘要。
 //
-// ★ 为什么 hy2 需要这一层，另外五协议不需要：
-// 五协议的打洞编排在 kernel 自己的 transport/realm.PunchTraced 里，埋点直接内联；
-// hy2 的编排在 sing-quic 的 Client.offerNewRealm 内部，kernel 一行都插不进去 ——
-// 这正是 probe_trace.go 顶部注释里记的 D3 缺口。fork 加了 DialObserver 回调口子后，
-// 本文件做的就是"把回调翻译成 Trace 方法调用"，不重复实现任何埋点逻辑。
+// ★ 为什么 hy2 需要这一层,另外五协议不需要:
+// 五协议的打洞编排在 kernel 自己的 transport/realm.PunchTraced 里,埋点直接内联;
+// hy2 的编排在 sing-quic 的 Client.offerNewRealm 内部,kernel 一行都插不进去
+// (probe_trace.go 顶部记的 D3 缺口)。本文件只做"回调 → Trace 方法",不重复实现埋点逻辑。
 //
-// ★ 三层隔离，缺一不可（本文件顶部的 //go:build otun_probe_trace 是第一层）：
-//  1. 构建标签 otun_probe_trace —— 生产构建不带此 tag，本文件**根本不参与编译**，
-//     所以上游 sing-quic 没有 DialObserver 类型也不会报错。
-//  2. go.probe.mod 的 replace —— 探针构建才把 sing-quic 指向带钩子的 fork。
-//  3. OTUN_PROBE_TRACE 环境变量 —— 运行期开关，未开时 Trace 为 nil，全链路 no-op。
-// 生产客户端三层全不沾：go.mod 一字未动、不带 tag、开关默认关。
+// ★ 2026-10-15 进生产构建(原先 //go:build otun_probe_trace + go.probe.mod 的 fork 才有):
+// 10-15 中国移动真机遥测里 hy2 的 punch_nonce / fail_stage 全 null —— 发版 Libbox 根本不带
+// 这条数据源,双端 join 只能靠时间 + IP 猜。B4 契约(2026-09-18 路线 B)本就要求生产连接
+// 产出这些字段且 inner_protocol 含 hysteria2。钩子已进树内 sing-quic(realm.DialObserver)。
 //
-// 设计约束与 transport/realm 埋点一致：
-//   - 只记录，不改变任何控制流；
-//   - Trace 为 nil 时所有方法是 no-op（nil-receiver 安全）；
-//   - 不推断结论，只记事实。
+// 零开销保证:realmtrace.Session 只在「探针开关开」或「App 订阅了摘要 sink」时返回非 nil;
+// 否则 NewDialObserver 返回 nil,sing-quic 侧全部 no-op。旧 App 不订阅 = 行为不变。
+//
+// 设计约束与 transport/realm 埋点一致:只记录,不改控制流;不推断结论,只记事实。
+// 每次建连一个 Trace(NewDialObserver 每次 offer 调一次),Finish 时输出恰好一次。
 
 import (
 	"net/netip"
@@ -31,66 +27,66 @@ import (
 	"github.com/sagernet/sing/common/logger"
 )
 
-// probeDialObserver 实现 squic.DialObserver，把回调翻成 Trace 调用。
-//
-// 🔴 trace 可以为 nil（埋点未开）——所有方法都靠 Trace 的 nil-receiver no-op 语义
-// 保持安全，本类型自身不做判空分支，与 transport/realm 的既有惯例一致。
 type probeDialObserver struct {
-	trace  *realmtrace.Trace
-	logger logger.Logger
+	trace       *realmtrace.Trace
+	logger      logger.Logger
+	stunServers []string
 }
 
-// STUNDiscovered 对应阶段 [1]：反射地址发现完毕。
-//
-// serversUsed 传配置里的 STUN 列表：与 transport/realm.PunchTraced 同样的取舍 ——
-// "实际哪台 STUN 回了包"的映射在 squic 内部不导出，宁可少记一个字段，
-// 也不编造一个看着精确的假值。这里 squic 侧连列表都不回传，故传 nil。
-func (o probeDialObserver) STUNDiscovered(localAddresses []netip.AddrPort) {
-	o.trace.STUNDone(localAddresses, nil)
+func (o *probeDialObserver) STUNDiscovered(localAddresses []netip.AddrPort) {
+	o.trace.STUNDone(localAddresses, o.stunServers)
 }
 
-// RendezvousDone 对应阶段 [2][3]：会合面换址完毕，且拿到双方共用的 metadata。
-//
-// ★ metadata 是会合面下发的那份（squic 侧已保证传的是 response.PunchMetadata），
-// 也就是实际打洞包用的 nonce、接收端记录的那个 —— 双端 join 靠它。
-func (o probeDialObserver) RendezvousDone(peerAddresses []netip.AddrPort, metadata squic.PunchMetadata) {
+// RendezvousDone:metadata 是会合面下发的那份,即打洞包实际用的 nonce、节点侧记录的那个 —— 双端 join 靠它。
+func (o *probeDialObserver) RendezvousDone(peerAddresses []netip.AddrPort, metadata squic.PunchMetadata) {
 	o.trace.RendezvousDone(peerAddresses)
 	o.trace.NonceNegotiated(metadata)
 	o.trace.CandidatesComputed(peerAddresses)
 }
 
-// PunchAttempted 对应阶段 [4]：某个地址族开始发 Hello。
-//
-// squic 侧每 family 调一次，与 HelloSent 的"一轮发送"语义对齐（多 family 并发时
-// Trace 内部有锁，计数安全）。
-func (o probeDialObserver) PunchAttempted(family string, candidates []netip.AddrPort) {
-	o.trace.CandidatesComputed(candidates)
+func (o *probeDialObserver) PunchAttempted(_ string, _ []netip.AddrPort) {
 	o.trace.HelloSent()
 }
 
-// PunchSettled 对应阶段 [5]：打洞落定。
-//
-// mode 传空与 transport/realm.PunchTraced 一致 —— punch/direct 是**节点侧配置**，
-// 客户端无从得知，由 prober 填。内核不编造自己观测不到的事实。
-// PunchSettled 对应阶段 [5]：打洞落定，**同时是 hy2 路径上的输出时机**。
-//
-// ★ 为什么在这里 Emit，而不像五协议那样在握手完成后：
-// 五协议的 QUIC/TLS 握手在 kernel 自己的 overlay 里，能调 HandshakeDoneAndEmit；
-// hy2 的握手在 sing-quic 的 authenticateAndWrap 内部，kernel **观测不到**。
-// 打洞落定是 kernel 在 hy2 路径上能确知的最后一个事实，所以在此输出。
-//
-// 🔴 代价要说清楚：hy2 的 trace 因此**没有 handshake_ms、tunnel_established 恒 false**。
-// 这不是 bug 而是观测边界——内核不编造自己观测不到的事实（与 mode 传空同一条原则）。
-// 隧道到底通没通，由 prober 经隧道真实往返（HTTP 204）判定，那才是 ok 的来源。
-//
-// mode 传空同 transport/realm.PunchTraced —— punch/direct 是节点侧配置，客户端无从得知。
-func (o probeDialObserver) PunchSettled(family string, result squic.PunchResult, err error) {
+// PunchSucceeded:mode 传空同 transport/realm.PunchTraced —— punch/direct 是节点侧配置,客户端观测不到。
+func (o *probeDialObserver) PunchSucceeded(family string, result squic.PunchResult) {
+	o.trace.PunchDone(result, family, "")
+}
+
+func (o *probeDialObserver) RelaySettled(relayAddr string, err error) {
 	if err != nil {
-		realmtrace.FailAndEmit(o.logger, o.trace, realmtrace.FailStagePunch, err)
+		o.trace.RelayFailed(err)
 		return
 	}
-	o.trace.PunchDone(result, family, "")
+	o.trace.RelayEstablished(relayAddr)
+}
+
+func (o *probeDialObserver) HandshakeDone() {
+	o.trace.HandshakeDone()
+}
+
+func (o *probeDialObserver) Failed(stage string, err error) {
+	o.trace.Fail(realmtrace.FailStage(stage), err)
+}
+
+func (o *probeDialObserver) Finish() {
 	realmtrace.Emit(o.logger, o.trace)
 }
 
-var _ squic.DialObserver = probeDialObserver{}
+var _ squic.DialObserver = (*probeDialObserver)(nil)
+
+// attachProbeDialObserver 给 realmOptions 挂上「每次建连新建一个 Trace」的观测器工厂。
+func attachProbeDialObserver(realmOptions *squic.Options, realmID string) {
+	if realmOptions == nil {
+		return
+	}
+	log := realmOptions.Logger
+	stunServers := realmOptions.STUNServers
+	realmOptions.NewDialObserver = func() squic.DialObserver {
+		trace := realmtrace.Session(realmID, "hysteria2")
+		if trace == nil {
+			return nil
+		}
+		return &probeDialObserver{trace: trace, logger: log, stunServers: stunServers}
+	}
+}

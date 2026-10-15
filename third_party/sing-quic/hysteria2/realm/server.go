@@ -49,6 +49,10 @@ type Options struct {
 	//
 	// 与 DirectAddresses 同型：空 = 不启用，行为与改动前逐字节一致。
 	RelayAddresses []netip.AddrPort
+
+	// NewDialObserver 非 nil → 发起端每次建连调一次,拿一个观测器(可返回 nil = 本次不观测)。
+	// 仅客户端使用;nil = 不观测,行为与改动前一致。见 dial_observer.go。
+	NewDialObserver func() DialObserver
 }
 
 type Server struct {

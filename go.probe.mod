@@ -179,6 +179,10 @@ require (
 // mismatch). This fork IS that version + realm wiring.
 replace github.com/sagernet/sing-box => ./
 
+// ⛔ 已废弃（2026-10-15）：hy2 发起端观测钩子已进树内 third_party/sing-quic（realm.DialObserver，
+//    工厂 Options.NewDialObserver），并随生产构建产出埋点；探针构建直接用 go.mod 即可。
+//    本文件 replace 到的 fork 仍是旧接口（Options.DialObserver），用它构建会编译失败，勿再使用。
+//
 // ★探针专用 modfile（用 `go build -modfile=go.probe.mod` 构建）。
 //
 // 为什么单独一份而不是改 go.mod：埋点仍在验证阶段，**验证产物不该与生产系统混淆**
