@@ -487,12 +487,7 @@ func racePunch(
 ) (*familyConn, squic.PunchResult, error) {
 	raceCtx, raceCancel := context.WithCancel(ctx)
 	defer raceCancel()
-	type outcome struct {
-		family *familyConn
-		result squic.PunchResult
-		err    error
-	}
-	out := make(chan outcome, len(families))
+	out := make(chan squic.PunchOutcome[*familyConn], len(families))
 	for _, family := range families {
 		go func() {
 			peers := make([]netip.AddrPort, 0, len(peerAddresses))
@@ -502,21 +497,23 @@ func racePunch(
 				}
 			}
 			punchResult, punchErr := squic.Punch(raceCtx, family.conn, peers, metadata)
-			out <- outcome{family: family, result: punchResult, err: punchErr}
+			out <- squic.PunchOutcome[*familyConn]{Family: family, IPv4: family.ipv4, Result: punchResult, Err: punchErr}
 		}()
 	}
-	var errs []error
-	for pending := len(families); pending > 0; pending-- {
-		result := <-out
-		if result.err == nil {
-			for _, family := range families {
-				if family != result.family {
-					_ = family.conn.Close()
-				}
+	// ★v4 先打通时给 v6 一个让步窗口 —— 与 hy2(sing-quic client.go realmRacePunch)共用
+	// squic.SelectPunchWinner,两份竞速实现不再各写一套(见 DefaultV6PreferGrace 依据)。
+	winner, ok, failures := squic.SelectPunchWinner(out, len(families), squic.DefaultV6PreferGrace)
+	if ok {
+		for _, family := range families {
+			if family != winner.Family {
+				_ = family.conn.Close()
 			}
-			return result.family, result.result, nil
 		}
-		errs = append(errs, E.Cause(result.err, result.family.family))
+		return winner.Family, winner.Result, nil
+	}
+	var errs []error
+	for _, failure := range failures {
+		errs = append(errs, E.Cause(failure.Err, failure.Family.family))
 	}
 	for _, family := range families {
 		_ = family.conn.Close()

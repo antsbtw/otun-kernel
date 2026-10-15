@@ -10,6 +10,7 @@ import (
 	"os"
 	"runtime"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/sagernet/quic-go"
@@ -82,6 +83,9 @@ type Client struct {
 	connAccess sync.Mutex
 	conn       *clientQUICConnection
 	pending    *clientOffer
+
+	// v4 连接僵死后的 v6 偏好期截止时刻(UnixNano,0=无),见 realm_stall.go。
+	preferV6Until atomic.Int64
 }
 
 func NewClient(options ClientOptions) (*Client, error) {
@@ -317,6 +321,7 @@ func (c *Client) offerNewRealm(ctx context.Context) (*clientQUICConnection, erro
 	winner, result, err := c.realmRacePunch(ctx, surviving, response.Addresses, response.PunchMetadata)
 	var peerAddr M.Socksaddr
 	var rawConn net.PacketConn
+	family := "relay"
 	if err != nil {
 		// ★中继回退（RELAY_FALLBACK_DESIGN.md §3.1）：对称 NAT 下打洞必败，
 		// 改由客户端与节点各自主动出站连中继、按 nonce 对接。
@@ -349,6 +354,7 @@ func (c *Client) offerNewRealm(ctx context.Context) (*clientQUICConnection, erro
 	} else {
 		rawConn = winner.conn
 		peerAddr = M.SocksaddrFromNetIP(result.PeerAddr)
+		family = winner.family
 	}
 	packetConn := rawConn
 	if c.geckoPassword != "" {
@@ -356,7 +362,12 @@ func (c *Client) offerNewRealm(ctx context.Context) (*clientQUICConnection, erro
 	} else if c.salamanderPassword != "" {
 		packetConn = NewSalamanderConn(packetConn, []byte(c.salamanderPassword))
 	}
-	return c.authenticateAndWrap(ctx, packetConn, peerAddr)
+	conn, err := c.authenticateAndWrap(ctx, packetConn, peerAddr)
+	if err != nil {
+		return nil, err
+	}
+	c.attachStallWatch(conn, family)
+	return conn, nil
 }
 
 func (c *Client) realmOpenFamilies(ctx context.Context) ([]*realmFamilyConn, error) {
@@ -503,12 +514,7 @@ func (c *Client) realmRacePunch(
 ) (*realmFamilyConn, realm.PunchResult, error) {
 	raceCtx, raceCancel := context.WithCancel(ctx)
 	defer raceCancel()
-	type outcome struct {
-		family *realmFamilyConn
-		result realm.PunchResult
-		err    error
-	}
-	out := make(chan outcome, len(families))
+	out := make(chan realm.PunchOutcome[*realmFamilyConn], len(families))
 	for _, family := range families {
 		go func() {
 			peers := make([]netip.AddrPort, 0, len(peerAddresses))
@@ -518,21 +524,23 @@ func (c *Client) realmRacePunch(
 				}
 			}
 			punchResult, punchErr := realm.Punch(raceCtx, family.conn, peers, metadata)
-			out <- outcome{family: family, result: punchResult, err: punchErr}
+			out <- realm.PunchOutcome[*realmFamilyConn]{Family: family, IPv4: family.ipv4, Result: punchResult, Err: punchErr}
 		}()
 	}
-	var errs []error
-	for pending := len(families); pending > 0; pending-- {
-		result := <-out
-		if result.err == nil {
-			for _, family := range families {
-				if family != result.family {
-					_ = family.conn.Close()
-				}
+	// ★v4 先打通时给 v6 一个让步窗口(见 realm.DefaultV6PreferGrace);本出口的 v4 连接
+	// 刚因僵死被关过,窗口放大(见 v6PreferGrace)。
+	winner, ok, failures := realm.SelectPunchWinner(out, len(families), c.v6PreferGrace())
+	if ok {
+		for _, family := range families {
+			if family != winner.Family {
+				_ = family.conn.Close()
 			}
-			return result.family, result.result, nil
 		}
-		errs = append(errs, E.Cause(result.err, result.family.family))
+		return winner.Family, winner.Result, nil
+	}
+	var errs []error
+	for _, failure := range failures {
+		errs = append(errs, E.Cause(failure.Err, failure.Family.family))
 	}
 	for _, family := range families {
 		_ = family.conn.Close()
@@ -619,10 +627,14 @@ func (c *Client) DialConn(ctx context.Context, destination M.Socksaddr) (net.Con
 	if err != nil {
 		return nil, err
 	}
-	return &clientConn{
+	clientConn := &clientConn{
 		Stream:      stream,
 		destination: destination,
-	}, nil
+	}
+	if conn.stall != nil {
+		clientConn.stall = &streamStall{watch: conn.stall}
+	}
+	return clientConn, nil
 }
 
 func (c *Client) ListenPacket(ctx context.Context) (net.PacketConn, error) {
@@ -690,6 +702,8 @@ type clientQUICConnection struct {
 	udpAccess    sync.RWMutex
 	udpConnMap   map[uint32]*udpPacketConn
 	udpSessionID uint32
+	// 僵死检测(仅 realm 连接,非 realm 为 nil),见 realm_stall.go。
+	stall *stallWatch
 }
 
 func (c *clientQUICConnection) active() bool {
@@ -720,6 +734,7 @@ type clientConn struct {
 	destination    M.Socksaddr
 	requestWritten bool
 	responseRead   bool
+	stall          *streamStall // 仅 realm 连接
 }
 
 func (c *clientConn) NeedHandshake() bool {
@@ -731,9 +746,16 @@ func (c *clientConn) Read(p []byte) (n int, err error) {
 		n, err = c.Stream.Read(p)
 		return n, qtls.WrapError(err)
 	}
+	if c.stall != nil {
+		c.stall.readStarted.Store(true)
+	}
 	status, errorMessage, err := protocol.ReadTCPResponse(c.Stream)
 	if err != nil {
 		return 0, qtls.WrapError(err)
+	}
+	// 收到响应(含 remote error)= 服务端收到了这条流,连接是活的。
+	if c.stall != nil {
+		c.stall.responseReceived()
 	}
 	if !status {
 		err = E.New("remote error: ", errorMessage)
@@ -753,6 +775,9 @@ func (c *clientConn) Write(p []byte) (n int, err error) {
 			return
 		}
 		c.requestWritten = true
+		if c.stall != nil {
+			c.stall.requestSent()
+		}
 		return len(p), nil
 	}
 	n, err = c.Stream.Write(p)
@@ -768,6 +793,9 @@ func (c *clientConn) RemoteAddr() net.Addr {
 }
 
 func (c *clientConn) Close() error {
+	if c.stall != nil {
+		c.stall.stop()
+	}
 	c.Stream.CancelRead(0)
 	return c.Stream.Close()
 }
