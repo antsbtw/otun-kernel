@@ -89,6 +89,9 @@ type Client struct {
 
 	// 直连握手连续失败计数与中继偏好期,见 realm_relay_fallback.go。
 	relayFallback relayFallbackState
+
+	// CloseWithError 后置位,空闲超时不再主动重连,见 realm_idle_reconnect.go。
+	closed atomic.Bool
 }
 
 func NewClient(options ClientOptions) (*Client, error) {
@@ -476,6 +479,7 @@ func (c *Client) realmHandshake(ctx context.Context, rawConn net.PacketConn, pee
 	}
 	obs.HandshakeDone()
 	c.attachStallWatch(conn, family)
+	c.watchIdleTimeout(conn, family)
 	return conn, nil
 }
 
@@ -775,6 +779,7 @@ func (c *Client) ListenPacket(ctx context.Context) (net.PacketConn, error) {
 }
 
 func (c *Client) CloseWithError(err error) error {
+	c.closed.Store(true)
 	c.connAccess.Lock()
 	conn := c.conn
 	c.conn = nil
