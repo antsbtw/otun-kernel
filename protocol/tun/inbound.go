@@ -55,6 +55,7 @@ type Inbound struct {
 	routeExcludeRuleSetCallback []*list.Element[adapter.RuleSetUpdateCallback]
 	routeAddressSet             []*netipx.IPSet
 	routeExcludeAddressSet      []*netipx.IPSet
+	connTracker                 tunConnTracker
 }
 
 func NewInbound(ctx context.Context, router adapter.Router, logger log.ContextLogger, tag string, options option.TunInboundOptions) (adapter.Inbound, error) {
@@ -452,6 +453,11 @@ func (t *Inbound) updateRouteAddressSet(it adapter.RuleSet) {
 }
 
 func (t *Inbound) Close() error {
+	// 先从 App 一侧关掉 TUN 入站连接、等 FIN 写回 utun，再拆栈（见 tunConnTracker）。
+	if closed := t.connTracker.closeAll(); closed > 0 {
+		t.logger.Info("closed ", closed, " tun connection(s) before stack shutdown")
+		time.Sleep(tunConnDrainDelay)
+	}
 	return common.Close(
 		t.tunStack,
 		t.tunIf,
@@ -506,6 +512,10 @@ func (t *Inbound) NewConnectionEx(ctx context.Context, conn net.Conn, source M.S
 	} else {
 		t.logger.InfoContext(ctx, "inbound connection from ", metadata.Source)
 		t.logger.InfoContext(ctx, "inbound connection to ", metadata.Destination)
+	}
+	onClose, ok := t.connTracker.track(conn, onClose)
+	if !ok {
+		return
 	}
 	t.router.RouteConnectionEx(ctx, conn, metadata, onClose)
 }
