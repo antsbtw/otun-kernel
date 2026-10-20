@@ -53,7 +53,18 @@ type Options struct {
 	// NewDialObserver 非 nil → 发起端每次建连调一次,拿一个观测器(可返回 nil = 本次不观测)。
 	// 仅客户端使用;nil = 不观测,行为与改动前一致。见 dial_observer.go。
 	NewDialObserver func() DialObserver
+
+	// PunchFamily 限定发起端打洞的地址族:"" = 双栈(默认),"v4" / "v6" = 只开该族的
+	// socket —— STUN、/connect 上报、打洞都只走这一族。仅客户端使用,测试 v4/v6 对比用
+	// (CLIENT_REQ_2026-10-20 K4):只留 v6 STUN 服务器强制不了 v6,STUN 写的是域名,
+	// v4 照样解析回来,节点也会主动朝 v4 打洞。
+	PunchFamily string
 }
+
+const (
+	PunchFamilyV4 = "v4"
+	PunchFamilyV6 = "v6"
+)
 
 type Server struct {
 	options       Options

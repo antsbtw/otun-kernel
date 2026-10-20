@@ -120,6 +120,13 @@ func NewClient(options ClientOptions) (*Client, error) {
 	if options.RealmOptions != nil && len(options.ServerPorts) > 0 {
 		return nil, E.New("realm and port hopping are mutually exclusive")
 	}
+	if options.RealmOptions != nil {
+		switch options.RealmOptions.PunchFamily {
+		case "", realm.PunchFamilyV4, realm.PunchFamilyV6:
+		default:
+			return nil, E.New("realm: invalid punch_family: ", options.RealmOptions.PunchFamily)
+		}
+	}
 	if options.GeckoPassword != "" {
 		if options.GeckoMinPacketSize == 0 {
 			options.GeckoMinPacketSize = geckoDefaultMinPacketSize
@@ -484,13 +491,20 @@ func (c *Client) realmHandshake(ctx context.Context, rawConn net.PacketConn, pee
 }
 
 func (c *Client) realmOpenFamilies(ctx context.Context) ([]*realmFamilyConn, error) {
-	specs := []struct {
+	type familySpec struct {
 		family string
 		ipv4   bool
 		addr   M.Socksaddr
-	}{
-		{"v4", true, M.SocksaddrFrom(netip.IPv4Unspecified(), 0)},
-		{"v6", false, M.SocksaddrFrom(netip.IPv6Unspecified(), 0)},
+	}
+	specs := []familySpec{
+		{realm.PunchFamilyV4, true, M.SocksaddrFrom(netip.IPv4Unspecified(), 0)},
+		{realm.PunchFamilyV6, false, M.SocksaddrFrom(netip.IPv6Unspecified(), 0)},
+	}
+	// punch_family 限定时只开该族的 socket，下游 STUN / 上报 / 打洞随之只走这一族。
+	if only := c.realmOptions.PunchFamily; only != "" {
+		specs = common.Filter(specs, func(spec familySpec) bool {
+			return spec.family == only
+		})
 	}
 	conns := make([]*realmFamilyConn, len(specs))
 	listenErrs := make([]error, len(specs))
