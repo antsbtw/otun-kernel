@@ -420,9 +420,7 @@ func (c *Client) offerNewRealmPunch(ctx context.Context, allowRelay bool) (*clie
 		c.realmWarn("realm: falling back to relay with a fresh rendezvous")
 		return nil, &realmRelayFallback{localAddresses: localAddresses}, err
 	}
-	if c.relayFallback.handshakeSucceeded() {
-		c.realmWarn("realm: direct handshake succeeded (family ", winner.family, "), switched back from relay")
-	}
+	// 握手成功不清零失败计数：要等直连验证通过（见 realm_direct_verify.go）。
 	return conn, nil, nil
 }
 
@@ -498,6 +496,8 @@ func (c *Client) realmHandshake(ctx context.Context, rawConn net.PacketConn, pee
 	c.watchIdleTimeout(conn, family)
 	if family == "relay" {
 		c.probeDirectWhileRelayed(conn)
+	} else {
+		c.verifyDirect(conn)
 	}
 	return conn, nil
 }
@@ -852,6 +852,8 @@ type clientQUICConnection struct {
 	family string
 	// 未关闭的 TCP 流数,中继切回直连后据此排空,见 realm_direct_probe.go。
 	streams atomic.Int32
+	// 直连(v4/v6)验证通过时关闭,中继连接为 nil,见 realm_direct_verify.go。
+	verified chan struct{}
 }
 
 func (c *clientQUICConnection) active() bool {

@@ -12,12 +12,12 @@ import (
 // ★ 为什么要主动切回：中继多一跳、占中继带宽；而 K2 的中继偏好期只在**重拨**时
 // 才到期重试直连，中继连接只要不断就一直用下去。
 //
-// ★ 切换方式：直连握手成功后把 c.conn 换成直连 —— 之后的新流、新 UDP 会话都走直连；
+// ★ 切换方式：直连握手成功、且验证通过（见 realm_direct_verify.go）后把 c.conn 换成直连 —— 之后的新流、新 UDP 会话都走直连；
 // 中继连接上的现有流不打断，等它们全部结束（或 relayDrainMax 封顶）再关。
 // 推送这类长连接会让中继多留一阵，但不会被切换打断。
 //
 // 🔴 探测只试直连（offerNewRealmPunch allowRelay=false），失败不回退中继、不另起一条中继。
-// 直连握手失败照常计入 relayFallback，偏好期随之延长；成功则清零。
+// 直连握手失败或验证失败照常计入 relayFallback，偏好期随之延长；验证通过才清零。
 const (
 	directProbeInitial = time.Minute
 	directProbeMax     = 10 * time.Minute
@@ -54,6 +54,13 @@ func (c *Client) probeDirectWhileRelayed(relayConn *clientQUICConnection) {
 			if err != nil {
 				backoff = min(backoff*2, directProbeMax)
 				c.realmWarn("realm: direct retry failed, next in ", backoff, ": ", err)
+				continue
+			}
+			// 握手成功不切：逐流掐断的网络里握手能完成、连接随即死掉（见 realm_direct_verify.go）。
+			// 验证失败已由 verifyDirect 计数并关闭直连。
+			if !awaitDirectVerified(ctx, direct) {
+				backoff = min(backoff*2, directProbeMax)
+				c.realmWarn("realm: direct retry unverified, staying on relay, next in ", backoff)
 				continue
 			}
 			if !c.swapConn(relayConn, direct) {

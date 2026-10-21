@@ -17,9 +17,11 @@ import (
 //     relayJoinWindow（25s）；打洞 + 15s 握手超时之后可能已经不在了。
 //  2. 连续直连握手失败 ≥ relayPreferThreshold 次：之后一段时间内的拨号跳过
 //     打洞直接走中继，时长按 relayPreferBackoff 起翻倍、封顶 relayPreferMaxBackoff；
-//     到期后的下一次拨号重新试直连，成功即清零，失败则下一档。
+//     到期后的下一次拨号重新试直连，验证通过即清零，失败则下一档。
+//  3. 直连握手成功后 directVerifyDeadline 内一个包都没收到，同样计一次失败
+//     （见 realm_direct_verify.go）。
 //
-// 🔴 只有**直连**握手成功才清零。中继握手成功不清零：否则每次中继连接断了重拨
+// 🔴 只有**直连**验证通过才清零。中继握手成功不清零：否则每次中继连接断了重拨
 // 都要先在直连上白等 15s 握手超时，正是要消除的那段不通。
 const (
 	relayPreferThreshold  = 2
@@ -34,7 +36,7 @@ type relayFallbackState struct {
 	until    time.Time
 }
 
-// handshakeFailed 记一次直连握手失败，返回当前连续失败次数。
+// handshakeFailed 记一次直连失败（握手失败或验证失败），返回当前连续失败次数。
 func (s *relayFallbackState) handshakeFailed(now time.Time) int {
 	s.access.Lock()
 	defer s.access.Unlock()
@@ -50,7 +52,7 @@ func (s *relayFallbackState) handshakeFailed(now time.Time) int {
 	return s.failures
 }
 
-// handshakeSucceeded 记一次直连握手成功并清零，返回此前是否处于中继偏好期。
+// handshakeSucceeded 记一次直连验证通过并清零，返回此前是否处于中继偏好期。
 func (s *relayFallbackState) handshakeSucceeded() bool {
 	s.access.Lock()
 	defer s.access.Unlock()

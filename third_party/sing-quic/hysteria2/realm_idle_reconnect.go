@@ -32,14 +32,19 @@ func (c *Client) watchIdleTimeout(conn *clientQUICConnection, family string) {
 		return c.conn == conn
 	}, func() {
 		c.realmWarn("realm: connection idle timeout (family ", family, "), reconnecting proactively")
-		offerCtx := c.ctx
-		if offerCtx == nil {
-			offerCtx = context.Background()
-		}
-		if _, err := c.offer(offerCtx); err != nil {
-			c.realmWarn("realm: proactive reconnect failed: ", err)
-		}
+		c.reconnectProactively()
 	})
+}
+
+// reconnectProactively 发起一次 offer，不等新流。
+func (c *Client) reconnectProactively() {
+	offerCtx := c.ctx
+	if offerCtx == nil {
+		offerCtx = context.Background()
+	}
+	if _, err := c.offer(offerCtx); err != nil {
+		c.realmWarn("realm: proactive reconnect failed: ", err)
+	}
 }
 
 // idleReconnect 等 connCtx 结束；若 cause 是空闲超时且 shouldReconnect 成立，调用 reconnect。
