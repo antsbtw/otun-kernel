@@ -4,6 +4,7 @@ import (
 	"context"
 	"time"
 
+	"github.com/sagernet/quic-go"
 	E "github.com/sagernet/sing/common/exceptions"
 )
 
@@ -15,18 +16,30 @@ import (
 //   - 每次握手成功都把失败计数与中继偏好期清零，空闲超时重连又握手成功、又清零，
 //     永远进不了偏好期。实测断网 3 分 17 秒。
 //
-// ★ 判据：握手后先等 directVerifySettle（避开握手收尾那段时间里到达的包），此后只要
-// 收到对端任何一个包就算直连可用。不需要额外发包：quic-go 在最后一次收包后
-// KeepAlivePeriod（10s）发保活 PING，对端必回 ACK，健康的空闲连接也会在 ~10s 内收到包。
+// ★ 判据：握手后先等 directVerifySettle，此后出现**新的 RTT 样本**才算直连可用。
+// quic-go 只在对端 ACK 新确认了我方最大包号、且其中有 ack-eliciting 包时才更新 RTT
+// （sent_packet_handler.ReceivedAck），所以新样本 = 我方 settle 之后发出的包到了对端。
+//
+// 🔴 不能用「收到对端的包」：逐流掐断只断客户端→节点，节点收不到 ACK 会一直重传，
+// 客户端照样收包（复测 2026-10-22：4b 断网 ~11 分钟，验证全被重传包满足）。重传包里的
+// ACK 只确认断流前的旧包，不产生新样本。
+//
+// 不额外发包（服务端解析不了的数据报会关掉整条连接，空流请求会在节点留错误日志）：
+//   - 有流量的连接：我方的流数据被 ACK 即产生样本；只收不发的连接每
+//     MaxNonAckElicitingAcks（19）个纯 ACK 包会带一个 PING。
+//   - 空闲连接：两侧 KeepAlivePeriod 都是 10s，计时从「最后一次收包」起算，收到对方的
+//     PING 会推迟自己的那次，所以两侧 PING 严格交替。握手后第一轮若是节点先发，客户端
+//     要到第二轮（~20s + RTT）才发出 PING。directVerifyDeadline 取 25s 覆盖两轮，
+//     且仍小于 MaxIdleTimeout（30s）。
 //
 // ★ 结果：
 //   - 验证通过：才清零失败计数（relayFallback.handshakeSucceeded）；后台探测才切回直连。
-//   - directVerifyDeadline 内一个包都没收到：按直连失败计数（偏好期照常生效）、关闭连接；
-//     若它是当前连接，立即重连（不等 30s 空闲超时）。
+//   - directVerifyDeadline 内没有新的 RTT 样本：按直连失败计数（偏好期照常生效）、关闭连接；
+//     若它是当前连接，立即重连（比 30s 空闲超时早）。
 //   - 验证前连接因其它原因关闭（被替换、Client 关闭等）：不计数。
 const (
 	directVerifySettle   = 2 * time.Second
-	directVerifyDeadline = 15 * time.Second
+	directVerifyDeadline = 25 * time.Second
 	directVerifyPoll     = 500 * time.Millisecond
 )
 
@@ -38,8 +51,18 @@ const (
 	directClosed
 )
 
-// waitDirectVerified 等 settle 之后 packets() 再增长。ctx 结束（连接关闭）返回 directClosed。
-func waitDirectVerified(ctx context.Context, packets func() uint64, settle, deadline, poll time.Duration) directVerifyResult {
+// rttSample 是 RTT 统计的快照；任一字段变化即有新样本（三者同时不变需要新样本与旧值逐 ns 相等）。
+type rttSample struct {
+	latest, smoothed, deviation time.Duration
+}
+
+func quicRTTSample(conn *quic.Conn) rttSample {
+	stats := conn.ConnectionStats()
+	return rttSample{stats.LatestRTT, stats.SmoothedRTT, stats.MeanDeviation}
+}
+
+// waitDirectVerified 等 settle 之后出现新的 RTT 样本。ctx 结束（连接关闭）返回 directClosed。
+func waitDirectVerified(ctx context.Context, sample func() rttSample, settle, deadline, poll time.Duration) directVerifyResult {
 	settleTimer := time.NewTimer(settle)
 	defer settleTimer.Stop()
 	select {
@@ -47,7 +70,7 @@ func waitDirectVerified(ctx context.Context, packets func() uint64, settle, dead
 		return directClosed
 	case <-settleTimer.C:
 	}
-	base := packets()
+	base := sample()
 	ticker := time.NewTicker(poll)
 	defer ticker.Stop()
 	deadlineTimer := time.NewTimer(deadline - settle)
@@ -57,11 +80,11 @@ func waitDirectVerified(ctx context.Context, packets func() uint64, settle, dead
 		case <-ctx.Done():
 			return directClosed
 		case <-ticker.C:
-			if packets() > base {
+			if sample() != base {
 				return directVerified
 			}
 		case <-deadlineTimer.C:
-			if packets() > base {
+			if sample() != base {
 				return directVerified
 			}
 			return directUnverified
@@ -73,8 +96,8 @@ func waitDirectVerified(ctx context.Context, packets func() uint64, settle, dead
 func (c *Client) verifyDirect(conn *clientQUICConnection) {
 	conn.verified = make(chan struct{})
 	go func() {
-		result := waitDirectVerified(conn.quicConn.Context(), func() uint64 {
-			return conn.quicConn.ConnectionStats().PacketsReceived
+		result := waitDirectVerified(conn.quicConn.Context(), func() rttSample {
+			return quicRTTSample(conn.quicConn)
 		}, directVerifySettle, directVerifyDeadline, directVerifyPoll)
 		switch result {
 		case directVerified:
@@ -84,7 +107,7 @@ func (c *Client) verifyDirect(conn *clientQUICConnection) {
 			}
 		case directUnverified:
 			failures := c.relayFallback.handshakeFailed(time.Now())
-			c.realmWarn("realm: direct connection received nothing within ", directVerifyDeadline, " after handshake (", failures, " consecutive, family ", conn.family, "), closing")
+			c.realmWarn("realm: direct connection got no ack for our packets within ", directVerifyDeadline, " after handshake (", failures, " consecutive, family ", conn.family, "), closing")
 			current := c.isCurrentConn(conn)
 			conn.closeWithError(E.New("realm: direct connection unverified"))
 			if current {
