@@ -111,7 +111,8 @@ func NewOutbound(ctx context.Context, router adapter.Router, logger log.ContextL
 				}
 				return dnsRouter.Lookup(ctx, host, dnsOptions)
 			},
-			Logger: logger,
+			Logger:      logger,
+			PunchFamily: options.Realm.PunchFamily,
 		}
 		// 挂上发起端建连观测（住宅面 punch_nonce / fail_stage 的数据源）。App 未订阅摘要、
 		// 探针开关未开时每次建连都拿到 nil 观测器，零开销。见 probe_dial_observer.go。

@@ -86,6 +86,12 @@ type Client struct {
 
 	// v4 连接僵死后的 v6 偏好期截止时刻(UnixNano,0=无),见 realm_stall.go。
 	preferV6Until atomic.Int64
+
+	// 直连握手连续失败计数与中继偏好期,见 realm_relay_fallback.go。
+	relayFallback relayFallbackState
+
+	// CloseWithError 后置位,空闲超时不再主动重连,见 realm_idle_reconnect.go。
+	closed atomic.Bool
 }
 
 func NewClient(options ClientOptions) (*Client, error) {
@@ -113,6 +119,13 @@ func NewClient(options ClientOptions) (*Client, error) {
 	}
 	if options.RealmOptions != nil && len(options.ServerPorts) > 0 {
 		return nil, E.New("realm and port hopping are mutually exclusive")
+	}
+	if options.RealmOptions != nil {
+		switch options.RealmOptions.PunchFamily {
+		case "", realm.PunchFamilyV4, realm.PunchFamilyV6:
+		default:
+			return nil, E.New("realm: invalid punch_family: ", options.RealmOptions.PunchFamily)
+		}
 	}
 	if options.GeckoPassword != "" {
 		if options.GeckoMinPacketSize == 0 {
@@ -294,18 +307,41 @@ type realmFamilyConn struct {
 	localAddresses []netip.AddrPort
 }
 
+// offerNewRealm 是住宅面建连入口。打洞成功但握手失败时，换新 nonce 重新
+// /connect 改走中继（见 realm_relay_fallback.go）。
 func (c *Client) offerNewRealm(ctx context.Context) (*clientQUICConnection, error) {
+	conn, fallback, err := c.offerNewRealmPunch(ctx, true)
+	if fallback == nil {
+		return conn, err
+	}
+	relayConn, relayErr := c.offerNewRealmRelay(ctx, fallback)
+	if relayErr != nil {
+		c.realmWarn("realm: relay fallback after handshake failure failed: ", relayErr)
+		// 与打洞失败的回退同一约束：回退失败返回原错误，原文不改。
+		return nil, err
+	}
+	return relayConn, nil
+}
+
+// realmRelayFallback 是「打洞成功、握手失败」后改走中继所需的上下文。
+type realmRelayFallback struct {
+	localAddresses []netip.AddrPort
+}
+
+// offerNewRealmPunch 打洞并握手。allowRelay=false 只试直连（走中继期间的后台
+// 直连重试，见 realm_direct_probe.go）：不走偏好期、打洞失败不回退、握手失败不给回退上下文。
+func (c *Client) offerNewRealmPunch(ctx context.Context, allowRelay bool) (*clientQUICConnection, *realmRelayFallback, error) {
 	obs := c.newDialObserver()
 	defer obs.Finish()
 	families, err := c.realmOpenFamilies(ctx)
 	if err != nil {
 		obs.Failed("stun", err)
-		return nil, err
+		return nil, nil, err
 	}
 	surviving, localAddresses, err := c.realmDiscoverFamilies(ctx, families)
 	if err != nil {
 		obs.Failed("stun", err)
-		return nil, err
+		return nil, nil, err
 	}
 	obs.STUNDiscovered(localAddresses)
 	closeSurviving := func() {
@@ -317,21 +353,34 @@ func (c *Client) offerNewRealm(ctx context.Context) (*clientQUICConnection, erro
 	if err != nil {
 		closeSurviving()
 		obs.Failed("rendezvous", err)
-		return nil, E.Cause(err, "generate punch metadata")
+		return nil, nil, E.Cause(err, "generate punch metadata")
 	}
 	response, err := c.controlClient.Connect(ctx, c.realmOptions.RealmID, localAddresses, localMetadata)
 	if err != nil {
 		closeSurviving()
 		obs.Failed("rendezvous", err)
-		return nil, E.Cause(err, "realm connect")
+		return nil, nil, E.Cause(err, "realm connect")
 	}
 	obs.RendezvousDone(response.Addresses, response.PunchMetadata)
+	if failures, prefer := c.relayFallback.preferRelay(time.Now()); allowRelay && prefer {
+		if len(response.Relay) > 0 {
+			c.realmWarn("realm: ", failures, " consecutive handshake failures, using relay without punching")
+			// 打洞 socket 先留着：中继报到失败时还能接着打洞，不至于在中继坏掉时一直卡在偏好期里。
+			conn, joined, relayErr := c.realmDialRelay(ctx, response, obs)
+			if joined {
+				closeSurviving()
+				return conn, nil, relayErr
+			}
+		} else {
+			c.realmWarn("realm: ", failures, " consecutive handshake failures but relay list is empty, punching anyway")
+		}
+	}
 	winner, result, err := c.realmRacePunch(ctx, surviving, response.Addresses, response.PunchMetadata, obs)
-	var peerAddr M.Socksaddr
-	var rawConn net.PacketConn
-	family := "relay"
 	if err != nil {
 		obs.Failed("punch", err)
+		if !allowRelay {
+			return nil, nil, err
+		}
 		// ★中继回退（RELAY_FALLBACK_DESIGN.md §3.1）：对称 NAT 下打洞必败，
 		// 改由客户端与节点各自主动出站连中继、按 nonce 对接。
 		//
@@ -346,32 +395,90 @@ func (c *Client) offerNewRealm(ctx context.Context) (*clientQUICConnection, erro
 		//     换 socket 收到的字节进不了协议栈。
 		//  3. 回退失败时返回**原打洞错误**，错误原文一字不改（既有归类依赖它）。
 		if len(response.Relay) == 0 {
-			return nil, err
+			c.realmWarn("realm: punch failed and relay list is empty, not falling back to relay")
+			return nil, nil, err
 		}
-		// realmRacePunch 失败时关闭了全部 socket，中继需要一只新的。
-		relayConn, listenErr := c.dialer.ListenPacket(ctx, M.SocksaddrFrom(netip.IPv4Unspecified(), 0))
-		if listenErr != nil {
-			obs.RelaySettled("", listenErr)
-			return nil, err
+		conn, joined, relayErr := c.realmDialRelay(ctx, response, obs)
+		if !joined {
+			return nil, nil, err
 		}
-		relayAddr, relayErr := realm.RaceRelayJoin(ctx, relayConn, response.Relay, response.PunchMetadata.Nonce)
-		if relayErr != nil {
-			obs.RelaySettled("", relayErr)
-		} else {
-			obs.RelaySettled(relayAddr.String(), nil)
-		}
-		if relayErr != nil {
-			_ = relayConn.Close()
-			return nil, err
-		}
-		rawConn = relayConn
-		peerAddr = M.SocksaddrFromNetIP(relayAddr)
-	} else {
-		rawConn = winner.conn
-		peerAddr = M.SocksaddrFromNetIP(result.PeerAddr)
-		family = winner.family
-		obs.PunchSucceeded(winner.family, result)
+		return conn, nil, relayErr
 	}
+	obs.PunchSucceeded(winner.family, result)
+	sourcePort := M.SocksaddrFromNet(winner.conn.LocalAddr()).Port
+	conn, err := c.realmHandshake(ctx, winner.conn, M.SocksaddrFromNetIP(result.PeerAddr), winner.family, obs)
+	if err != nil {
+		failures := c.relayFallback.handshakeFailed(time.Now())
+		c.realmWarn("realm: handshake failed after punch (", failures, " consecutive, family ", winner.family, ", source port ", sourcePort, "): ", err)
+		if !allowRelay {
+			return nil, nil, err
+		}
+		if len(response.Relay) == 0 {
+			c.realmWarn("realm: relay list is empty, not falling back to relay")
+			return nil, nil, err
+		}
+		c.realmWarn("realm: falling back to relay with a fresh rendezvous")
+		return nil, &realmRelayFallback{localAddresses: localAddresses}, err
+	}
+	// 握手成功不清零失败计数：要等直连验证通过（见 realm_direct_verify.go）。
+	return conn, nil, nil
+}
+
+// offerNewRealmRelay 换新 nonce 重新 /connect，跳过打洞直接走中继。
+// 是一次独立的建连：单独一条观测记录，nonce 与节点侧那条对得上。
+func (c *Client) offerNewRealmRelay(ctx context.Context, fallback *realmRelayFallback) (*clientQUICConnection, error) {
+	obs := c.newDialObserver()
+	defer obs.Finish()
+	obs.STUNDiscovered(fallback.localAddresses)
+	localMetadata, err := realm.GeneratePunchMetadata()
+	if err != nil {
+		obs.Failed("rendezvous", err)
+		return nil, E.Cause(err, "generate punch metadata")
+	}
+	response, err := c.controlClient.Connect(ctx, c.realmOptions.RealmID, fallback.localAddresses, localMetadata)
+	if err != nil {
+		obs.Failed("rendezvous", err)
+		return nil, E.Cause(err, "realm connect")
+	}
+	obs.RendezvousDone(response.Addresses, response.PunchMetadata)
+	if len(response.Relay) == 0 {
+		err = E.New("relay list is empty")
+		obs.Failed("punch", err)
+		return nil, err
+	}
+	conn, joined, err := c.realmDialRelay(ctx, response, obs)
+	if !joined {
+		obs.Failed("punch", err)
+	}
+	return conn, err
+}
+
+// realmDialRelay 在新 socket 上向中继报到并握手。joined 报告是否已与节点对接：
+// 未对接时调用方按各自约束处理（打洞失败的回退要返回原打洞错误）。
+func (c *Client) realmDialRelay(ctx context.Context, response *realm.ConnectResponse, obs dialObserver) (*clientQUICConnection, bool, error) {
+	// 打洞 socket 已关或仍在给打洞用，中继需要一只新的。
+	relayConn, err := c.dialer.ListenPacket(ctx, M.SocksaddrFrom(netip.IPv4Unspecified(), 0))
+	if err != nil {
+		obs.RelaySettled("", err)
+		return nil, false, err
+	}
+	relayAddr, err := realm.RaceRelayJoin(ctx, relayConn, response.Relay, response.PunchMetadata.Nonce)
+	if err != nil {
+		obs.RelaySettled("", err)
+		_ = relayConn.Close()
+		return nil, false, err
+	}
+	obs.RelaySettled(relayAddr.String(), nil)
+	c.realmWarn("realm: joined relay ", relayAddr)
+	conn, err := c.realmHandshake(ctx, relayConn, M.SocksaddrFromNetIP(relayAddr), "relay", obs)
+	if err != nil {
+		c.realmWarn("realm: handshake via relay ", relayAddr, " failed: ", err)
+	}
+	return conn, true, err
+}
+
+// realmHandshake 在打洞或中继得到的 socket 上加混淆、做 QUIC 握手与认证。
+func (c *Client) realmHandshake(ctx context.Context, rawConn net.PacketConn, peerAddr M.Socksaddr, family string, obs dialObserver) (*clientQUICConnection, error) {
 	packetConn := rawConn
 	if c.geckoPassword != "" {
 		packetConn = NewGeckoConn(packetConn, []byte(c.geckoPassword), c.geckoMinPacketSize, c.geckoMaxPacketSize)
@@ -384,18 +491,32 @@ func (c *Client) offerNewRealm(ctx context.Context) (*clientQUICConnection, erro
 		return nil, err
 	}
 	obs.HandshakeDone()
+	conn.family = family
 	c.attachStallWatch(conn, family)
+	c.watchIdleTimeout(conn, family)
+	if family == "relay" {
+		c.probeDirectWhileRelayed(conn)
+	} else {
+		c.verifyDirect(conn)
+	}
 	return conn, nil
 }
 
 func (c *Client) realmOpenFamilies(ctx context.Context) ([]*realmFamilyConn, error) {
-	specs := []struct {
+	type familySpec struct {
 		family string
 		ipv4   bool
 		addr   M.Socksaddr
-	}{
-		{"v4", true, M.SocksaddrFrom(netip.IPv4Unspecified(), 0)},
-		{"v6", false, M.SocksaddrFrom(netip.IPv6Unspecified(), 0)},
+	}
+	specs := []familySpec{
+		{realm.PunchFamilyV4, true, M.SocksaddrFrom(netip.IPv4Unspecified(), 0)},
+		{realm.PunchFamilyV6, false, M.SocksaddrFrom(netip.IPv6Unspecified(), 0)},
+	}
+	// punch_family 限定时只开该族的 socket，下游 STUN / 上报 / 打洞随之只走这一族。
+	if only := c.realmOptions.PunchFamily; only != "" {
+		specs = common.Filter(specs, func(spec familySpec) bool {
+			return spec.family == only
+		})
 	}
 	conns := make([]*realmFamilyConn, len(specs))
 	listenErrs := make([]error, len(specs))
@@ -647,9 +768,11 @@ func (c *Client) DialConn(ctx context.Context, destination M.Socksaddr) (net.Con
 	if err != nil {
 		return nil, err
 	}
+	conn.streams.Add(1)
 	clientConn := &clientConn{
 		Stream:      stream,
 		destination: destination,
+		release:     sync.OnceFunc(func() { conn.streams.Add(-1) }),
 	}
 	if conn.stall != nil {
 		clientConn.stall = &streamStall{watch: conn.stall}
@@ -684,6 +807,7 @@ func (c *Client) ListenPacket(ctx context.Context) (net.PacketConn, error) {
 }
 
 func (c *Client) CloseWithError(err error) error {
+	c.closed.Store(true)
 	c.connAccess.Lock()
 	conn := c.conn
 	c.conn = nil
@@ -724,6 +848,12 @@ type clientQUICConnection struct {
 	udpSessionID uint32
 	// 僵死检测(仅 realm 连接,非 realm 为 nil),见 realm_stall.go。
 	stall *stallWatch
+	// realm 连接的地址族("v4"/"v6"/"relay",非 realm 为空)。
+	family string
+	// 未关闭的 TCP 流数,中继切回直连后据此排空,见 realm_direct_probe.go。
+	streams atomic.Int32
+	// 直连(v4/v6)验证通过时关闭,中继连接为 nil,见 realm_direct_verify.go。
+	verified chan struct{}
 }
 
 func (c *clientQUICConnection) active() bool {
@@ -755,6 +885,7 @@ type clientConn struct {
 	requestWritten bool
 	responseRead   bool
 	stall          *streamStall // 仅 realm 连接
+	release        func()       // 归还所属连接的流计数,只生效一次
 }
 
 func (c *clientConn) NeedHandshake() bool {
@@ -813,6 +944,9 @@ func (c *clientConn) RemoteAddr() net.Addr {
 }
 
 func (c *clientConn) Close() error {
+	if c.release != nil {
+		c.release()
+	}
 	if c.stall != nil {
 		c.stall.stop()
 	}

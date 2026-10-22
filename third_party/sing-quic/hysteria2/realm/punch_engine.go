@@ -51,6 +51,20 @@ type PunchResult struct {
 	Type     byte
 }
 
+// Punch 是客户端打洞。只有收到对端的 PunchAck（我方 Hello 到了对端、对端的 Ack
+// 回到我）才宣告成功，与节点侧 Respond 的往返确认对称（KR2，2026-10-21）。
+//
+// 背景实证：河南联通 v4 → sg-02、移动蜂窝 39.144 → jp-01/jp-02，节点侧失败记录
+// recv_count 绝大多数只有 1–4。原实现收到节点主动发来的 Hello 就返回成功，而这只
+// 证明「节点→客户端」单向可达；客户端随即停发 Hello、在死路上等满 15s QUIC 握手
+// 超时，且握手失败不进中继回退，用户断网直到换节点。
+//
+// 收到 Hello 时：
+//   - 先向来源地址补发一个 Hello 再回 Ack，并把来源地址加入候选。节点收到 Ack 即判
+//     成功并注销本次尝试，之后到达的 Hello 不会再被回 Ack；先 Hello 后 Ack，节点先
+//     回我 Ack 再判成功。来源地址可能不在会合面下发的候选里（节点侧 NAT 改写端口）。
+//   - 从第一个 Hello 起 punchConfirmWindow 内等不到 Ack，判本路打洞失败：节点的包能到、
+//     我的包到不了，继续耗到 punchTimeout 也不会变，早失败让调用方尽快回退中继。
 func Punch(ctx context.Context, conn net.PacketConn, peerAddresses []netip.AddrPort, metadata PunchMetadata) (PunchResult, error) {
 	candidates := candidatePunchAddrs(peerAddresses)
 	if len(candidates) == 0 {
@@ -62,6 +76,7 @@ func Punch(ctx context.Context, conn net.PacketConn, peerAddresses []netip.AddrP
 	defer conn.SetReadDeadline(time.Time{})
 
 	nextSend := time.Now()
+	var confirmDeadline time.Time
 	buffer := make([]byte, saltLength+minBodySize+maxPadding)
 	for {
 		err := ctx.Err()
@@ -69,11 +84,17 @@ func Punch(ctx context.Context, conn net.PacketConn, peerAddresses []netip.AddrP
 			return PunchResult{}, E.Cause(err, "punch timeout")
 		}
 		now := time.Now()
+		if !confirmDeadline.IsZero() && !now.Before(confirmDeadline) {
+			return PunchResult{}, E.New("punch unconfirmed: received peer hello but no ack within ", punchConfirmWindow)
+		}
 		if !now.Before(nextSend) {
 			sendPunchPackets(conn, candidates, PunchHello, metadata)
 			nextSend = now.Add(punchInterval)
 		}
 		deadline := nextSend
+		if !confirmDeadline.IsZero() && confirmDeadline.Before(deadline) {
+			deadline = confirmDeadline
+		}
 		ctxDeadline, deadlineSet := ctx.Deadline()
 		if deadlineSet && ctxDeadline.Before(deadline) {
 			deadline = ctxDeadline
@@ -94,10 +115,17 @@ func Punch(ctx context.Context, conn net.PacketConn, peerAddresses []netip.AddrP
 		if decodeErr != nil {
 			continue
 		}
-		if packetType == PunchHello {
-			sendPunchPacket(conn, peerAddr, PunchAck, metadata)
+		if packetType == PunchAck {
+			return PunchResult{PeerAddr: peerAddr, Type: packetType}, nil
 		}
-		return PunchResult{PeerAddr: peerAddr, Type: packetType}, nil
+		if !slices.Contains(candidates, peerAddr) {
+			candidates = append(candidates, peerAddr)
+		}
+		sendPunchPacket(conn, peerAddr, PunchHello, metadata)
+		sendPunchPacket(conn, peerAddr, PunchAck, metadata)
+		if confirmDeadline.IsZero() {
+			confirmDeadline = time.Now().Add(punchConfirmWindow)
+		}
 	}
 }
 

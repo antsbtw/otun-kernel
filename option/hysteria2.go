@@ -31,6 +31,8 @@ type Hysteria2Realm struct {
 	RealmID     string                     `json:"realm_id"`
 	STUNServers badoption.Listable[string] `json:"stun_servers"`
 	HTTPClient  *HTTPClientOptions         `json:"http_client,omitempty"`
+	// PunchFamily 限定打洞地址族:"" 双栈(默认) / "v4" / "v6"。仅出站生效,测试用。
+	PunchFamily string `json:"punch_family,omitempty"`
 }
 
 type Hysteria2InboundRealm struct {
