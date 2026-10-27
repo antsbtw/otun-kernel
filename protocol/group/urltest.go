@@ -44,6 +44,7 @@ type URLTest struct {
 	idleTimeout                  time.Duration
 	group                        *URLTestGroup
 	interruptExternalConnections bool
+	failoverStrikes              uint8
 }
 
 func NewURLTest(ctx context.Context, router adapter.Router, logger log.ContextLogger, tag string, options option.URLTestOutboundOptions) (adapter.Outbound, error) {
@@ -59,6 +60,7 @@ func NewURLTest(ctx context.Context, router adapter.Router, logger log.ContextLo
 		tolerance:                    options.Tolerance,
 		idleTimeout:                  time.Duration(options.IdleTimeout),
 		interruptExternalConnections: options.InterruptExistConnections,
+		failoverStrikes:              options.FailoverStrikes,
 	}
 	if len(outbound.tags) == 0 {
 		return nil, E.New("missing tags")
@@ -79,6 +81,7 @@ func (s *URLTest) Start() error {
 	if err != nil {
 		return err
 	}
+	group.failoverStrikes = int(s.failoverStrikes)
 	s.group = group
 	return nil
 }
@@ -137,7 +140,7 @@ func (s *URLTest) DialContext(ctx context.Context, network string, destination M
 		return s.group.interruptGroup.NewConn(conn, interrupt.IsExternalConnectionFromContext(ctx)), nil
 	}
 	s.logger.ErrorContext(ctx, err)
-	s.group.history.DeleteURLTestHistory(outbound.Tag())
+	s.group.onDialFailure(outbound)
 	return nil, err
 }
 
@@ -155,7 +158,7 @@ func (s *URLTest) ListenPacket(ctx context.Context, destination M.Socksaddr) (ne
 		return s.group.interruptGroup.NewPacketConn(conn, interrupt.IsExternalConnectionFromContext(ctx)), nil
 	}
 	s.logger.ErrorContext(ctx, err)
-	s.group.history.DeleteURLTestHistory(outbound.Tag())
+	s.group.onDialFailure(outbound)
 	return nil, err
 }
 
@@ -206,7 +209,16 @@ type URLTestGroup struct {
 	close                        chan struct{}
 	started                      bool
 	lastActive                   common.TypedValue[time.Time]
+
+	// 主备模式（failover_strikes > 0，OTun）：见 option.URLTestOutboundOptions.FailoverStrikes。
+	failoverStrikes int
+	strikeAccess    sync.Mutex
+	strikes         map[string]int // realTag → 连续测速失败次数，测通即清零
+	recheckPending  atomic.Bool
 }
+
+// 主备模式下第一次测速失败后多久重测（重测失败才算第二次）。
+const failoverRecheckDelay = 15 * time.Second
 
 func NewURLTestGroup(ctx context.Context, outboundManager adapter.OutboundManager, logger log.Logger, outbounds []adapter.Outbound, link string, interval time.Duration, tolerance uint16, idleTimeout time.Duration, interruptExternalConnections bool) (*URLTestGroup, error) {
 	if interval == 0 {
@@ -285,6 +297,9 @@ func (g *URLTestGroup) Close() error {
 }
 
 func (g *URLTestGroup) Select(network string) (adapter.Outbound, bool) {
+	if g.failoverStrikes > 0 {
+		return g.selectFailover(network)
+	}
 	var minDelay uint16
 	var minOutbound adapter.Outbound
 	switch network {
@@ -371,6 +386,7 @@ func (g *URLTestGroup) urlTest(ctx context.Context, force bool) (map[string]uint
 	b, _ := batch.New(ctx, batch.WithConcurrencyNum[any](10))
 	checked := make(map[string]bool)
 	var resultAccess sync.Mutex
+	var needRecheck atomic.Bool
 	for _, detour := range g.outbounds {
 		tag := detour.Tag()
 		realTag := RealTag(detour)
@@ -392,9 +408,21 @@ func (g *URLTestGroup) urlTest(ctx context.Context, force bool) (map[string]uint
 			t, err := urltest.URLTest(testCtx, g.link, p)
 			if err != nil {
 				g.logger.Debug("outbound ", tag, " unavailable: ", err)
+				if g.failoverStrikes > 0 {
+					count := g.addStrike(realTag)
+					if count < g.failoverStrikes {
+						g.logger.Info("outbound ", tag, " check failed (", count, "/", g.failoverStrikes, "), recheck in ", failoverRecheckDelay)
+						needRecheck.Store(true)
+						return nil, nil
+					}
+					g.logger.Info("outbound ", tag, " check failed ", count, " times in a row, failing over")
+				}
 				g.history.DeleteURLTestHistory(realTag)
 			} else {
 				g.logger.Debug("outbound ", tag, " available: ", t, "ms")
+				if g.failoverStrikes > 0 {
+					g.clearStrikes(realTag)
+				}
 				g.history.StoreURLTestHistory(realTag, &adapter.URLTestHistory{
 					Time:  time.Now(),
 					Delay: t,
@@ -408,6 +436,9 @@ func (g *URLTestGroup) urlTest(ctx context.Context, force bool) (map[string]uint
 	}
 	b.Wait()
 	g.performUpdateCheck()
+	if needRecheck.Load() {
+		g.scheduleCheck(failoverRecheckDelay)
+	}
 	return result, nil
 }
 
@@ -428,4 +459,91 @@ func (g *URLTestGroup) performUpdateCheck() {
 	if updated {
 		g.interruptGroup.Interrupt(g.interruptExternalConnections)
 	}
+}
+
+// selectFailover：主备模式选节点。当前节点没被判死就一直用它；否则按配置顺序取第一个没被判死的。
+// 不看延迟，所以不会因为另一个节点更快而切换，也不会自动切回。
+func (g *URLTestGroup) selectFailover(network string) (adapter.Outbound, bool) {
+	var selected adapter.Outbound
+	switch network {
+	case N.NetworkTCP:
+		selected = g.selectedOutboundTCP
+	case N.NetworkUDP:
+		selected = g.selectedOutboundUDP
+	}
+	if selected != nil && !g.condemned(RealTag(selected)) {
+		return selected, true
+	}
+	for _, detour := range g.outbounds {
+		if common.Contains(detour.Network(), network) && !g.condemned(RealTag(detour)) {
+			return detour, true
+		}
+	}
+	// 全部判死：留在当前节点；还没选过就取第一个，保证有出口可拨。
+	if selected != nil {
+		return selected, false
+	}
+	for _, detour := range g.outbounds {
+		if common.Contains(detour.Network(), network) {
+			return detour, false
+		}
+	}
+	return nil, false
+}
+
+func (g *URLTestGroup) condemned(realTag string) bool {
+	g.strikeAccess.Lock()
+	defer g.strikeAccess.Unlock()
+	return g.strikes[realTag] >= g.failoverStrikes
+}
+
+func (g *URLTestGroup) addStrike(realTag string) int {
+	g.strikeAccess.Lock()
+	defer g.strikeAccess.Unlock()
+	if g.strikes == nil {
+		g.strikes = make(map[string]int)
+	}
+	g.strikes[realTag]++
+	return g.strikes[realTag]
+}
+
+func (g *URLTestGroup) clearStrikes(realTag string) {
+	g.strikeAccess.Lock()
+	defer g.strikeAccess.Unlock()
+	delete(g.strikes, realTag)
+}
+
+// onDialFailure：普通模式照旧删测速记录（下一轮测速就换节点）；
+// 主备模式不直接判死，马上测一次速，测速失败才记一次（一阵连接同时失败只算一次）。
+func (g *URLTestGroup) onDialFailure(detour adapter.Outbound) {
+	if g.failoverStrikes == 0 {
+		g.history.DeleteURLTestHistory(detour.Tag())
+		return
+	}
+	g.scheduleCheck(0)
+}
+
+// scheduleCheck：delay 后强制测一轮（不受 interval 限制）。同一时刻只排一个；碰上正在测就顺延。
+func (g *URLTestGroup) scheduleCheck(delay time.Duration) {
+	if g.recheckPending.Swap(true) {
+		return
+	}
+	time.AfterFunc(delay, func() {
+		select {
+		case <-g.ctx.Done():
+			g.recheckPending.Store(false)
+			return
+		case <-g.close:
+			g.recheckPending.Store(false)
+			return
+		default:
+		}
+		if g.checking.Load() {
+			g.recheckPending.Store(false)
+			g.scheduleCheck(time.Second)
+			return
+		}
+		g.recheckPending.Store(false)
+		g.CheckOutbounds(true)
+	})
 }
