@@ -82,6 +82,10 @@ func (s *URLTest) Start() error {
 		return err
 	}
 	group.failoverStrikes = int(s.failoverStrikes)
+	if group.failoverStrikes > 0 {
+		// 主备模式一开始就定在第一个节点上，Now() 不会是空（健康检查组按 Now() 测当前节点）。
+		group.performUpdateCheck()
+	}
 	s.group = group
 	return nil
 }
@@ -387,7 +391,11 @@ func (g *URLTestGroup) urlTest(ctx context.Context, force bool) (map[string]uint
 	checked := make(map[string]bool)
 	var resultAccess sync.Mutex
 	var needRecheck atomic.Bool
-	for _, detour := range g.outbounds {
+	targets := g.outbounds
+	if g.failoverStrikes > 0 {
+		targets = g.failoverCheckTargets()
+	}
+	for _, detour := range targets {
 		tag := detour.Tag()
 		realTag := RealTag(detour)
 		if checked[realTag] {
@@ -402,10 +410,14 @@ func (g *URLTestGroup) urlTest(ctx context.Context, force bool) (map[string]uint
 		if !loaded {
 			continue
 		}
+		member, _ := detour.(*URLTest)
 		b.Go(realTag, func() (any, error) {
 			testCtx, cancel := context.WithTimeout(g.ctx, C.TCPTimeout)
 			defer cancel()
 			t, err := urltest.URLTest(testCtx, g.link, p)
+			if member != nil && member.group != nil && member.group.failoverStrikes > 0 {
+				member.group.onExternalProbe(realTag, err)
+			}
 			if err != nil {
 				g.logger.Debug("outbound ", tag, " unavailable: ", err)
 				if g.failoverStrikes > 0 {
@@ -479,16 +491,28 @@ func (g *URLTestGroup) selectFailover(network string) (adapter.Outbound, bool) {
 			return detour, true
 		}
 	}
-	// 全部判死：留在当前节点；还没选过就取第一个，保证有出口可拨。
-	if selected != nil {
-		return selected, false
-	}
+	// 全部判死（切到的备用节点也不可用）：清零，回到第一个（primary）重新开始。
+	g.resetStrikes()
 	for _, detour := range g.outbounds {
 		if common.Contains(detour.Network(), network) {
-			return detour, false
+			return detour, true
 		}
 	}
 	return nil, false
+}
+
+// failoverCheckTargets：主备模式只测正在用的节点（TCP/UDP 各自选中的，通常是同一个）。
+// 备用节点平时一次都不测；当前节点被判死后直接切过去，切过去之后才开始测它。
+// 不测备用是为了让平时只有主节点能看到这台设备的 IP（2026-10-30 后端需求：两台节点被按共同用户关联后一起被封）。
+func (g *URLTestGroup) failoverCheckTargets() []adapter.Outbound {
+	var targets []adapter.Outbound
+	for _, network := range []string{N.NetworkTCP, N.NetworkUDP} {
+		outbound, _ := g.selectFailover(network)
+		if outbound != nil && !common.Contains(targets, outbound) {
+			targets = append(targets, outbound)
+		}
+	}
+	return targets
 }
 
 func (g *URLTestGroup) condemned(realTag string) bool {
@@ -507,10 +531,36 @@ func (g *URLTestGroup) addStrike(realTag string) int {
 	return g.strikes[realTag]
 }
 
+func (g *URLTestGroup) resetStrikes() {
+	g.strikeAccess.Lock()
+	defer g.strikeAccess.Unlock()
+	clear(g.strikes)
+}
+
 func (g *URLTestGroup) clearStrikes(realTag string) {
 	g.strikeAccess.Lock()
 	defer g.strikeAccess.Unlock()
 	delete(g.strikes, realTag)
+}
+
+// onExternalProbe：别的 urltest 组（App 的健康检查组）把本组当成员、测了本组当前节点，结果同样算本组的一次测速。
+// 健康检查判失败时本组同步计数，连续失败够数就当场切到下一个节点，不用等自己下一轮测速；
+// App 随后再测一次，测的已经是新节点。
+func (g *URLTestGroup) onExternalProbe(realTag string, err error) {
+	if err == nil {
+		g.clearStrikes(realTag)
+		return
+	}
+	count := g.addStrike(realTag)
+	g.logger.Info("outbound ", realTag, " external check failed (", count, "/", g.failoverStrikes, ")")
+	if count < g.failoverStrikes {
+		return
+	}
+	g.history.DeleteURLTestHistory(realTag)
+	// 本组正在测速时由它收尾切换（performUpdateCheck 在测速结束时调用），这里不并发切。
+	if !g.checking.Load() {
+		g.performUpdateCheck()
+	}
 }
 
 // onDialFailure：普通模式照旧删测速记录（下一轮测速就换节点）；

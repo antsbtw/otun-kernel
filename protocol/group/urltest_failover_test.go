@@ -9,6 +9,8 @@ import (
 	"testing"
 
 	"github.com/sagernet/sing-box/adapter"
+	"github.com/sagernet/sing-box/adapter/outbound"
+	C "github.com/sagernet/sing-box/constant"
 	"github.com/sagernet/sing-box/log"
 	E "github.com/sagernet/sing/common/exceptions"
 	M "github.com/sagernet/sing/common/metadata"
@@ -18,14 +20,16 @@ import (
 // fakeOutbound：测速时 up=true 就回 204，否则拨号失败。
 type fakeOutbound struct {
 	adapter.Outbound
-	tag string
-	up  atomic.Bool
+	tag   string
+	up    atomic.Bool
+	dials atomic.Int32
 }
 
 func (o *fakeOutbound) Tag() string       { return o.tag }
 func (o *fakeOutbound) Network() []string { return []string{N.NetworkTCP, N.NetworkUDP} }
 
 func (o *fakeOutbound) DialContext(ctx context.Context, network string, destination M.Socksaddr) (net.Conn, error) {
+	o.dials.Add(1)
 	if !o.up.Load() {
 		return nil, E.New(o.tag, " down")
 	}
@@ -174,5 +178,115 @@ func TestNonFailoverModeUnchanged(t *testing.T) {
 	g.CheckOutbounds(true)
 	if got := selectedTag(g); got != "backup" {
 		t.Fatalf("plain urltest should switch after one failure: got %s", got)
+	}
+}
+
+func TestFailoverNeverProbesBackupWhilePrimaryHealthy(t *testing.T) {
+	primary := &fakeOutbound{tag: "primary"}
+	backup := &fakeOutbound{tag: "backup"}
+	primary.up.Store(true)
+	backup.up.Store(true)
+	g := newFailoverGroup(t, 2, primary, backup)
+	for range 5 {
+		g.CheckOutbounds(true)
+	}
+	// 中间失败一次（未判死）也不去测备用。
+	primary.up.Store(false)
+	g.CheckOutbounds(true)
+	primary.up.Store(true)
+	g.CheckOutbounds(true)
+	if n := backup.dials.Load(); n != 0 {
+		t.Fatalf("backup probed %d times while primary healthy, want 0", n)
+	}
+	if n := primary.dials.Load(); n != 7 {
+		t.Fatalf("primary probed %d times, want 7", n)
+	}
+}
+
+func TestFailoverSwitchesWithoutProbingBackupFirst(t *testing.T) {
+	primary := &fakeOutbound{tag: "primary"}
+	backup := &fakeOutbound{tag: "backup"}
+	g := newFailoverGroup(t, 2, primary, backup)
+	g.CheckOutbounds(true)
+	g.CheckOutbounds(true)
+	if got := selectedTag(g); got != "backup" {
+		t.Fatalf("got %s, want backup", got)
+	}
+	if n := backup.dials.Load(); n != 0 {
+		t.Fatalf("backup probed %d times before switching, want 0", n)
+	}
+
+	// 切过去之后只测备用，不再测主节点。
+	backup.up.Store(true)
+	primaryDials := primary.dials.Load()
+	g.CheckOutbounds(true)
+	g.CheckOutbounds(true)
+	if n := primary.dials.Load() - primaryDials; n != 0 {
+		t.Fatalf("primary probed %d times while on backup, want 0", n)
+	}
+	if n := backup.dials.Load(); n != 2 {
+		t.Fatalf("backup probed %d times after switching, want 2", n)
+	}
+}
+
+func TestFailoverAllDownReturnsToPrimary(t *testing.T) {
+	primary := &fakeOutbound{tag: "primary"}
+	backup := &fakeOutbound{tag: "backup"}
+	g := newFailoverGroup(t, 2, primary, backup)
+	g.CheckOutbounds(true)
+	g.CheckOutbounds(true) // primary 判死 → backup
+	g.CheckOutbounds(true)
+	g.CheckOutbounds(true) // backup 也判死 → 回 primary 重新计数
+	if got := selectedTag(g); got != "primary" {
+		t.Fatalf("all down: got %s, want primary", got)
+	}
+	// 回到 primary 后重新计数：再失败一次不切。
+	g.CheckOutbounds(true)
+	if got := selectedTag(g); got != "primary" {
+		t.Fatalf("strikes should restart after reset: got %s", got)
+	}
+}
+
+// 健康检查组（普通 urltest）把主备组当成员：只测主备组当前节点，失败同样计入主备组。
+func TestHealthGroupProbesOnlyCurrentNodeAndDrivesFailover(t *testing.T) {
+	primary := &fakeOutbound{tag: "primary"}
+	backup := &fakeOutbound{tag: "backup"}
+	primary.up.Store(true)
+	backup.up.Store(true)
+	failover := newFailoverGroup(t, 2, primary, backup)
+	failover.performUpdateCheck()
+	proxy := &URLTest{
+		Adapter: outbound.NewAdapter(C.TypeURLTest, "proxy", []string{N.NetworkTCP, N.NetworkUDP}, []string{"primary", "backup"}),
+		group:   failover,
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	t.Cleanup(cancel)
+	health, err := NewURLTestGroup(ctx, &fakeOutboundManager{outbounds: []adapter.Outbound{primary, backup, proxy}},
+		log.NewNOPFactory().Logger(), []adapter.Outbound{proxy}, "http://probe.test/generate_204", 0, 0, 0, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	health.CheckOutbounds(true)
+	if n := backup.dials.Load(); n != 0 {
+		t.Fatalf("health check probed backup %d times, want 0", n)
+	}
+
+	// 健康检查连续失败两次：主备组切到 backup，之后健康检查测的是 backup。
+	primary.up.Store(false)
+	health.CheckOutbounds(true)
+	if got := selectedTag(failover); got != "primary" {
+		t.Fatalf("after 1 health failure: got %s, want primary", got)
+	}
+	health.CheckOutbounds(true)
+	if got := selectedTag(failover); got != "backup" {
+		t.Fatalf("after 2 health failures: got %s, want backup", got)
+	}
+	if n := backup.dials.Load(); n != 0 {
+		t.Fatalf("backup probed %d times before switching, want 0", n)
+	}
+	result, _ := health.urlTest(ctx, true)
+	if _, ok := result["proxy"]; !ok || backup.dials.Load() != 1 {
+		t.Fatalf("health check after switch should succeed via backup: result=%v backupDials=%d", result, backup.dials.Load())
 	}
 }
