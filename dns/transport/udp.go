@@ -5,6 +5,7 @@ import (
 	"net"
 	"sync"
 	"sync/atomic"
+	"time"
 
 	"github.com/sagernet/sing-box/adapter"
 	"github.com/sagernet/sing-box/common/dialer"
@@ -24,6 +25,11 @@ import (
 
 var _ adapter.DNSTransport = (*UDPTransport)(nil)
 
+// udpStallTimeout：查询第一次尝试等回包的时间，超过且会话上没有任何回包就换新会话重发。
+const udpStallTimeout = 2 * time.Second
+
+var errUDPSessionStalled = E.New("UDP session stalled")
+
 func RegisterUDP(registry *dns.TransportRegistry) {
 	dns.RegisterTransport[option.RemoteDNSServerOptions](registry, C.DNSTypeUDP, NewUDP)
 }
@@ -37,6 +43,9 @@ type UDPTransport struct {
 	udpSize    atomic.Int32
 
 	connection *ConnPool[net.Conn]
+
+	// 最近一次在共享会话上收到合法回包的时间（UnixNano），用来判断会话是否还活着。
+	lastReceive atomic.Int64
 
 	callbackAccess sync.RWMutex
 	queryId        uint16
@@ -158,6 +167,23 @@ func (t *UDPTransport) exchange(ctx context.Context, message *mDNS.Msg) (*mDNS.M
 		}
 	}
 
+	// 共享会话被中途静默掐断时（NAT 过期、路径断了），读写不会报错，要等 TCP keepalive
+	// 十几分钟后才发现，期间每个查询都超时。所以第一次尝试 udpStallTimeout 内没有回包、
+	// 会话上也没收到过任何回包，就作废会话，在新会话上重发一次。重发只有一次，
+	// 新会话上不再按 udpStallTimeout 作废，避免网络整体不通时不停新建会话。
+	response, retry, err := t.exchangeAttempt(ctx, message, true)
+	if !retry {
+		return response, err
+	}
+	t.logger.InfoContext(ctx, "UDP session stalled or closed, retrying on a new session")
+	response, _, err = t.exchangeAttempt(ctx, message, false)
+	return response, err
+}
+
+// exchangeAttempt 在共享会话上发一次查询。firstAttempt 时：
+//   - 写失败、udpStallTimeout 内会话无任何回包、或会话被其他查询 / 读错误作废，都返回 retry=true，由调用方在新会话上重发；
+//   - 会话在本查询发出后收到过别的回包，说明会话活着，只是这个查询的上游慢，继续等到 ctx 结束。
+func (t *UDPTransport) exchangeAttempt(ctx context.Context, message *mDNS.Msg, firstAttempt bool) (*mDNS.Msg, bool, error) {
 	conn, connCtx, created, err := t.connection.AcquireShared(ctx, func(ctx context.Context) (net.Conn, error) {
 		rawConn, err := t.dialer.DialContext(ctx, N.NetworkUDP, t.serverAddr)
 		if err != nil {
@@ -166,7 +192,7 @@ func (t *UDPTransport) exchange(ctx context.Context, message *mDNS.Msg) (*mDNS.M
 		return rawConn, nil
 	})
 	if err != nil {
-		return nil, err
+		return nil, false, err
 	}
 	if created {
 		go t.recvLoop(conn)
@@ -181,7 +207,7 @@ func (t *UDPTransport) exchange(ctx context.Context, message *mDNS.Msg) (*mDNS.M
 	if err != nil {
 		t.callbackAccess.Unlock()
 		t.connection.Release(conn, true)
-		return nil, err
+		return nil, false, err
 	}
 	t.callbacks[queryId] = callback
 	t.callbackAccess.Unlock()
@@ -202,25 +228,62 @@ func (t *UDPTransport) exchange(ctx context.Context, message *mDNS.Msg) (*mDNS.M
 
 	rawMessage, err := exMessage.PackBuffer(buffer.FreeBytes())
 	if err != nil {
-		return nil, err
+		return nil, false, err
 	}
 
+	sentAt := time.Now().UnixNano()
 	_, err = conn.Write(rawMessage)
 	if err != nil {
 		t.connection.Invalidate(conn, err)
-		return nil, E.Cause(err, "write request")
+		if firstAttempt {
+			return nil, true, nil
+		}
+		return nil, false, E.Cause(err, "write request")
 	}
 
+	var stall <-chan time.Time
+	if firstAttempt {
+		timer := time.NewTimer(udpStallTimeout)
+		defer timer.Stop()
+		stall = timer.C
+	}
+
+	for {
+		select {
+		case <-callback.done:
+			t.connection.Release(conn, true)
+			callback.response.Id = originalId
+			return callback.response, false, nil
+		case <-stall:
+			stall = nil
+			if callbackDone(callback) || t.lastReceive.Load() > sentAt {
+				continue
+			}
+			t.connection.Invalidate(conn, errUDPSessionStalled)
+			return nil, true, nil
+		case <-connCtx.Done():
+			if callbackDone(callback) {
+				callback.response.Id = originalId
+				return callback.response, false, nil
+			}
+			if firstAttempt && ctx.Err() == nil {
+				return nil, true, nil
+			}
+			return nil, false, context.Cause(connCtx)
+		case <-ctx.Done():
+			t.connection.Release(conn, true)
+			return nil, false, ctx.Err()
+		}
+	}
+}
+
+// callbackDone：回包和计时器 / 会话作废同时到达时，select 可能先选中后者，先看一眼回包到没到。
+func callbackDone(callback *udpCallback) bool {
 	select {
 	case <-callback.done:
-		t.connection.Release(conn, true)
-		callback.response.Id = originalId
-		return callback.response, nil
-	case <-connCtx.Done():
-		return nil, context.Cause(connCtx)
-	case <-ctx.Done():
-		t.connection.Release(conn, true)
-		return nil, ctx.Err()
+		return true
+	default:
+		return false
 	}
 }
 
@@ -237,6 +300,9 @@ func (t *UDPTransport) recvLoop(conn net.Conn) {
 		var message mDNS.Msg
 		err = message.Unpack(buffer.Bytes())
 		buffer.Release()
+		if err == nil {
+			t.lastReceive.Store(time.Now().UnixNano())
+		}
 		if err != nil {
 			t.logger.Debug("discarded malformed UDP response: ", err)
 			continue
