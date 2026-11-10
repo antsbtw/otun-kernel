@@ -221,11 +221,19 @@ func NewInbound(ctx context.Context, router adapter.Router, logger log.ContextLo
 			ExcludeMACAddress:                     excludeMACAddress,
 			InterfaceMonitor:                      networkManager.InterfaceMonitor(),
 			EXP_MultiPendingPackets:               multiPendingPackets,
+			OTunOptions: tun.OTunOptions{
+				StrictRouteBlockBypassUDP:     options.StrictRouteBlockBypassUDP,
+				StrictRouteBypassUDPAllowApps: options.StrictRouteBypassUDPAllowApps,
+			},
 		},
 		udpTimeout:        udpTimeout,
 		stack:             options.Stack,
 		platformInterface: platformInterface,
 		platformOptions:   common.PtrValueOrDefault(options.Platform),
+	}
+	if options.StrictRouteBlockBypassUDP {
+		// OTun: lets sing-tun report the Windows bypass-UDP filter result.
+		inbound.tunOptions.Logger = logger
 	}
 	for _, routeAddressSet := range options.RouteAddressSet {
 		ruleSet, loaded := router.RuleSet(routeAddressSet)

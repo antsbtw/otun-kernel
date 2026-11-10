@@ -28,6 +28,11 @@ type TunInboundOptions struct {
 	ExcludeMPTCP                  bool                             `json:"exclude_mptcp,omitempty"`
 	LoopbackAddress               badoption.Listable[netip.Addr]   `json:"loopback_address,omitempty"`
 	StrictRoute                   bool                             `json:"strict_route,omitempty"`
+	// OTun, Windows only (ignored elsewhere): block UDP leaving outside the TUN
+	// under strict_route (WebRTC real-IP leak). Must only be emitted by the
+	// Windows config generator: older kernels reject unknown fields.
+	StrictRouteBlockBypassUDP     bool                             `json:"strict_route_block_bypass_udp,omitempty"`
+	StrictRouteBypassUDPAllowApps badoption.Listable[string]       `json:"strict_route_bypass_udp_allow_apps,omitempty"`
 	RouteAddress                  badoption.Listable[netip.Prefix] `json:"route_address,omitempty"`
 	RouteAddressSet               badoption.Listable[string]       `json:"route_address_set,omitempty"`
 	RouteExcludeAddress           badoption.Listable[netip.Prefix] `json:"route_exclude_address,omitempty"`
