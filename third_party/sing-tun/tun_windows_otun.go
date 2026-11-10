@@ -42,6 +42,7 @@ var (
 	otunLocalRanges4 = []netip.Prefix{
 		netip.MustParsePrefix("0.0.0.0/32"), // DHCP discover source
 		netip.MustParsePrefix("10.0.0.0/8"),
+		netip.MustParsePrefix("100.64.0.0/10"), // CGNAT / Tailscale tailnet (its IPv6 fd7a:115c:a1e0::/48 is inside fc00::/7)
 		netip.MustParsePrefix("127.0.0.0/8"),
 		netip.MustParsePrefix("169.254.0.0/16"),
 		netip.MustParsePrefix("172.16.0.0/12"),
